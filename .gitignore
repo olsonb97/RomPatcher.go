@@ -1,3 +1,10 @@
-_test_files
-node_modules
-package-lock.json
+.tmp/
+.audit-*/
+bin/
+dist/
+/rompatcher
+/rompatcher.exe
+*.test
+coverage.out
+testdata/corpus/roms/
+testdata/corpus/patches/
