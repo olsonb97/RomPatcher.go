@@ -5,6 +5,12 @@ A native, lightweight Go rewrite of
 providing the patching engine and CLI without the web frontend.
 The library requires Go 1.21 or newer; release binaries require no Go runtime.
 
+## AI-assisted development
+
+This Go rewrite was developed with substantial assistance from OpenAI Codex.
+Although it has been reviewed and tested, AI-assisted code can contain mistakes.
+Users should independently evaluate and test it for their use case.
+
 ## Format support
 
 | Format | Apply | Create | Validation |
