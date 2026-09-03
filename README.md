@@ -1,9 +1,10 @@
 # RomPatcher.go
 
-A native, lightweight Go rewrite of
-[RomPatcher.js](https://github.com/marcrobledo/RomPatcher.js) by Marc Robledo,
-providing the patching engine and CLI without the web frontend.
-The library requires Go 1.21 or newer; release binaries require no Go runtime.
+A native Go library and command-line ROM patcher, rewritten from
+[RomPatcher.js](https://github.com/marcrobledo/RomPatcher.js) by Marc Robledo.
+This repository contains the patching engine and CLI only; it has no web
+frontend. Building from source requires Go 1.21 or newer. Prebuilt binaries are
+self-contained and do not require a Go installation.
 
 ## AI-assisted development
 
@@ -13,29 +14,43 @@ Users should independently evaluate and test it for their use case.
 
 ## Format support
 
-| Format | Apply | Create | Validation |
+| Format | Apply | Create | Source/target validation |
 | --- | --- | --- | --- |
 | IPS / IPS32 / EBP | Yes | Yes | — |
-| UPS | Yes, bidirectional | Yes | CRC32 |
-| BPS | Yes | Yes | CRC32 |
-| APS (N64) | Yes | Yes | N64 cart ID + CRC |
-| APS (GBA) | Yes | No (reference engine is also apply-only) | CRC16 |
-| RUP / NINJA2 | Yes, including undo | Yes | MD5 |
-| PPF 1–3 | Yes, including undo data | Yes | Size, block check, and undo records when present |
-| BSDIFF40 (`.bdf` / `.bspatch`) | Yes | No (reference engine is also apply-only) | — |
-| Paper Mario Star Rod (`.mod`) | Yes | No (reference engine is also apply-only) | CRC32 |
-| VCDIFF / xdelta | Yes, including xdelta3 LZMA | No (reference engine is also apply-only) | Adler-32 windows |
+| UPS | Yes, forward or reverse | Yes | Size + source/target CRC32 |
+| BPS | Yes | Yes | Size + source/target CRC32 |
+| APS (N64) | Yes | Yes | N64 cart ID + stored header CRC |
+| APS (GBA) | Yes | No | Source size + per-block CRC16 |
+| RUP / NINJA2 | Yes, forward or reverse | Yes | Source/target MD5 |
+| PPF 1–3 | Yes, including undo when present | Yes | Size, block check, and undo records when present |
+| BSDIFF40 (`.bdf` / `.bspatch`) | Yes | No | — |
+| Paper Mario Star Rod (`.mod`) | Yes | No | Fixed source size + CRC32 |
+| VCDIFF / xdelta | Yes, including xdelta3 LZMA | No | Optional per-window Adler-32 |
+
+Validation refers to checks enabled by `ApplyOptions.Validate` or CLI `-v`.
+Malformed patch data and embedded patch checksums are rejected while parsing.
+PPF creation cannot represent an output smaller than its input.
 
 VCDIFF supports RFC 3284 default and custom code tables, source/target windows,
 configurable address caches, Adler-32 validation, and xdelta3's common LZMA
 secondary compression through the pure-Go `github.com/ulikunitz/xz` package.
-The uncommon DJW and FGK secondary compressors remain unsupported.
+DJW and FGK secondary compression are detected and reported as unsupported.
+
+## Installation
+
+Download a platform archive from
+[GitHub Releases](https://github.com/olsonb97/RomPatcher.go/releases/latest), or
+install the latest version with Go:
+
+```console
+go install github.com/olsonb97/RomPatcher.go/cmd/rompatcher@latest
+```
 
 ## Library
 
 ```go
-patch, err := rompatcher.Parse(patchBytes)
-output, err := patch.Apply(sourceBytes, rompatcher.ApplyOptions{Validate: true})
+output, err := rompatcher.Apply(sourceBytes, patchBytes,
+    rompatcher.ApplyOptions{Validate: true})
 
 created, err := rompatcher.Create(original, modified, rompatcher.FormatBPS, nil)
 patchBytes, err := created.MarshalBinary()
@@ -45,18 +60,20 @@ size, err := rompatcher.ApplyReaderAt(ctx, source, sourceSize, patchFile,
     patchSize, output, options)
 ```
 
-`ApplyWithOptions` also supports temporary copier-header removal/addition and
-Game Boy or Mega Drive/Genesis internal checksum repair. `ApplyOptions` accepts
-a `context.Context` and progress callback. File-backed patching keeps source and
-output data out of memory; VCDIFF retains only the current target window.
-Temporary header/checksum transformations use the compatibility memory path.
-`Inspect`, `DryRun`, and `ApplyChain` provide structured metadata, validation
-previews, and ordered patch chains.
+`ApplyOptions` supports cancellation, progress callbacks, an output-size limit,
+temporary iNES, FDS, Lynx, or SNES copier-header handling, and Game Boy or Mega
+Drive/Genesis internal checksum repair. The default output limit is 64 MiB plus
+twice the source size.
+
+`ApplyReaderAt` and `ApplyFile` keep the source and output file-backed for every
+supported format; the patch itself is parsed in memory. VCDIFF retains only the
+current target window. Header and checksum compatibility transformations use
+the memory-backed path. `Inspect`, `DryRun`, and `ApplyChain` provide structured
+metadata, output hashes, validation previews, and ordered patch chains.
 
 ## CLI
 
 ```console
-go install github.com/olsonb97/RomPatcher.go/cmd/rompatcher@latest
 rompatcher apply game.sfc translation.bps -v -o game-patched.sfc
 rompatcher apply --dry-run --json game.sfc translation.bps
 rompatcher apply games.zip patch.bps -s "region/game.sfc" -o game.sfc
@@ -65,19 +82,24 @@ rompatcher archive games.zip
 rompatcher create original.sfc modified.sfc -f bps -o patch.bps
 rompatcher inspect --json patch.bps
 rompatcher hash game.sfc
+rompatcher batch jobs.json
 rompatcher version
 ```
 
-Use `-` for stdin or stdout. ZIP archives use Go's built-in `archive/zip`; when
-multiple ROM or patch candidates exist, the CLI refuses to guess and requires
-`--source-entry` or `--patch-entry`. Outputs are written to a temporary file,
-synced, and atomically published only after patching succeeds; existing outputs are preserved.
-Common options have matching short forms: `-o/--output`, `-v/--validate`,
-`-n/--dry-run`, `-j/--json`, `-p/--progress`, and `-m/--max-output`. Options
-work before or after filenames. Supplying multiple patches to `apply` creates
-an ordered chain; `chain` remains as a readable alias.
+### Applying patches
 
-Batch mode accepts a JSON manifest:
+`rompatcher apply SOURCE PATCH [PATCH...]` applies patches from left to right.
+Useful options are `-o` for output, `-v` to validate, `-n` for a dry run, `-j`
+for JSON, and `-p` for progress. Run `rompatcher apply --help` for the rest.
+
+ZIP files are supported, but 7z files are not. If a ZIP contains multiple
+choices, run `rompatcher archive FILE.zip`, then select one with `-s` for the
+source or `-e` for a patch. Use `-` for stdin or stdout where applicable.
+Existing output files are never overwritten.
+
+### Batch manifests
+
+`rompatcher batch jobs.json` accepts this structure:
 
 ```json
 {
@@ -94,8 +116,30 @@ Batch mode accepts a JSON manifest:
 }
 ```
 
-The `cmd/releasepack` helper packages a manually built release binary with the
-project and dependency licenses, a SHA-256 checksum, and an SPDX 2.3 SBOM.
+Each job requires `source`, `patches`, and `output`; `output` is optional with
+`batch -n`. Optional fields are `sourceEntry`, `validate`, `removeHeader`,
+`addHeader`, `fixChecksum`, and `maxOutput`. Each patch requires `path` and may
+include `entry` for ZIP selection.
+
+## Building release archives
+
+The build script requires Python 3 and Go. With no `-t` options it builds all
+nine targets:
+
+```console
+python build_release.py 1.0.1
+```
+
+Use `-t` to select one or more targets:
+
+```console
+python build_release.py 1.0.1 -t windows/amd64
+python build_release.py 1.0.1 -t windows/amd64,linux/amd64
+python build_release.py --list-targets
+```
+
+Use `-o DIR` to change the output directory. Archives include the license files,
+and their SHA-256 hashes are written to `checksums.txt`.
 
 ## License
 
@@ -112,8 +156,9 @@ go test ./...
 go vet ./...
 ```
 
-The tests cover every format, malformed-input safety, resizing, cancellation,
-atomic output, ZIP ambiguity, chains, custom VCDIFF tables, reversible RUP,
-header handling, and exact known patch checksums. An optional real-world corpus
+The tests cover every supported apply format and every supported creator,
+malformed-input safety, resizing, cancellation, atomic output, ZIP ambiguity,
+chains, custom VCDIFF tables, LZMA secondary compression, reversible UPS and
+RUP, header handling, and known patch checksums. An optional real-world corpus
 harness provides broader compatibility coverage without redistributing
 third-party patches or game data.
