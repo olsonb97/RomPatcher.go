@@ -138,15 +138,6 @@ func checkedInt(v uint64) (int, error) {
 	return n, nil
 }
 
-func resizedCopy(src []byte, size int) ([]byte, error) {
-	if size < 0 {
-		return nil, fmt.Errorf("%w: negative output size", ErrInvalidPatch)
-	}
-	out := make([]byte, size)
-	copy(out, src)
-	return out, nil
-}
-
 func fillBytes(dst []byte, value byte) {
 	if len(dst) == 0 {
 		return

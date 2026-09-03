@@ -28,7 +28,8 @@ Users should independently evaluate and test it for their use case.
 | VCDIFF / xdelta | Yes, including xdelta3 LZMA | No | Optional per-window Adler-32 |
 
 Validation refers to checks enabled by `ApplyOptions.Validate` or CLI `-v`.
-Malformed patch data and embedded patch checksums are rejected while parsing.
+Invalid headers, payloads, and embedded patch checksums are rejected as they
+are decoded.
 PPF creation cannot represent an output smaller than its input.
 
 VCDIFF supports RFC 3284 default and custom code tables, source/target windows,
@@ -55,9 +56,11 @@ output, err := rompatcher.Apply(sourceBytes, patchBytes,
 created, err := rompatcher.Create(original, modified, rompatcher.FormatBPS, nil)
 patchBytes, err := created.MarshalBinary()
 
-// Cancellable random-access file patching for every supported format.
+// Cancellable, bounded-memory patching and creation.
 size, err := rompatcher.ApplyReaderAt(ctx, source, sourceSize, patchFile,
     patchSize, output, options)
+size, err = rompatcher.CreateReaderAt(ctx, originalFile, originalSize,
+    modifiedFile, modifiedSize, patchOutput, rompatcher.FormatBPS, nil)
 ```
 
 `ApplyOptions` supports cancellation, progress callbacks, an output-size limit,
@@ -66,10 +69,12 @@ Drive/Genesis internal checksum repair. The default output limit is 64 MiB plus
 twice the source size.
 
 `ApplyReaderAt` and `ApplyFile` keep the source and output file-backed for every
-supported format; the patch itself is parsed in memory. VCDIFF retains only the
-current target window. Header and checksum compatibility transformations use
-the memory-backed path. `Inspect`, `DryRun`, and `ApplyChain` provide structured
-metadata, output hashes, validation previews, and ordered patch chains.
+supported format and decode patch records incrementally. `CreateReaderAt` and
+`CreateFile` also keep both input files out of memory unless BPS delta matching
+is explicitly enabled. VCDIFF retains only the current target window. Header
+and checksum compatibility transformations use the memory-backed path.
+`ApplyFileChain` uses temporary files between patches. `Inspect`, `DryRun`, and
+`ApplyChain` provide their in-memory counterparts.
 
 ## CLI
 
@@ -154,6 +159,7 @@ archive alongside [`LICENSE`](LICENSE).
 ```console
 go test ./...
 go vet ./...
+go test -bench . -benchmem
 ```
 
 The tests cover every supported apply format and every supported creator,

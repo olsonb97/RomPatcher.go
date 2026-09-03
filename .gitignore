@@ -1,5 +1,7 @@
 .tmp/
-.audit-*/
+.audit-*
+__pycache__/
+*.py[cod]
 bin/
 dist/
 /rompatcher

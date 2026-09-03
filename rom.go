@@ -2,12 +2,12 @@ package rompatcher
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
 )
 
+// HeaderInfo describes a recognized copier or container header.
 type HeaderInfo struct {
 	Name string
 	Size int
@@ -22,6 +22,8 @@ var knownHeaders = []struct {
 func extension(name string) string {
 	return strings.TrimPrefix(strings.ToLower(filepath.Ext(name)), ".")
 }
+
+// CanAddHeader reports whether a temporary header can be added for name.
 func CanAddHeader(data []byte, name string) *HeaderInfo {
 	if len(data) > 0x600000 {
 		return nil
@@ -36,6 +38,8 @@ func CanAddHeader(data []byte, name string) *HeaderInfo {
 	}
 	return nil
 }
+
+// DetectHeader reports a recognized header already present in data.
 func DetectHeader(data []byte, name string) *HeaderInfo {
 	if len(data) > 0x600200 || len(data)%1024 == 0 {
 		return nil
@@ -50,6 +54,8 @@ func DetectHeader(data []byte, name string) *HeaderInfo {
 	}
 	return nil
 }
+
+// RemoveHeader separates a recognized header from ROM data.
 func RemoveHeader(data []byte, name string) (header, rom []byte, info *HeaderInfo) {
 	info = DetectHeader(data, name)
 	if info == nil {
@@ -57,6 +63,8 @@ func RemoveHeader(data []byte, name string) (header, rom []byte, info *HeaderInf
 	}
 	return append([]byte(nil), data[:info.Size]...), append([]byte(nil), data[info.Size:]...), info
 }
+
+// AddHeader prepends a suitable temporary header when the format is recognized.
 func AddHeader(data []byte, name string) ([]byte, *HeaderInfo) {
 	info := CanAddHeader(data, name)
 	if info == nil {
@@ -88,6 +96,8 @@ func romSystem(data []byte, name string) string {
 	}
 	return ""
 }
+
+// FixROMChecksum repairs a recognized internal ROM checksum in place.
 func FixROMChecksum(data []byte, name string) bool {
 	switch romSystem(data, name) {
 	case "gb":
@@ -118,6 +128,8 @@ func FixROMChecksum(data []byte, name string) bool {
 	}
 	return false
 }
+
+// AdditionalChecksum returns format-specific source identification when available.
 func AdditionalChecksum(data []byte, name string) string {
 	if romSystem(data, name) == "n64" && len(data) >= 0x3f {
 		return fmt.Sprintf("%s (%x)", data[0x3c:0x3f], data[0x10:0x18])
@@ -125,74 +137,42 @@ func AdditionalChecksum(data []byte, name string) string {
 	return ""
 }
 
+// ApplyWithOptions is an explicit-name alias for Apply.
 func ApplyWithOptions(source, patchData []byte, opts ApplyOptions) ([]byte, error) {
 	return Apply(source, patchData, opts)
 }
+
+// ApplyParsedWithOptions applies an already parsed patch in memory.
 func ApplyParsedWithOptions(source []byte, p Patch, opts ApplyOptions) ([]byte, error) {
-	if opts.RemoveHeader && opts.AddHeader {
-		return nil, errors.New("remove-header and add-header cannot be used together")
+	if isNilInterface(p) {
+		return nil, fmt.Errorf("%w: nil patch", ErrInvalidPatch)
 	}
-	if err := reportProgress(opts, Progress{Phase: "prepare", Format: p.Format(), Total: int64(len(source))}); err != nil {
+	if bdf, ok := p.(*BDFPatch); ok {
+		if len(bdf.data) == 0 {
+			return nil, ErrUnsupported
+		}
+		return applyEncodedWithOptions(source, bdf.data, opts)
+	}
+	var (
+		data []byte
+		err  error
+	)
+	switch patch := p.(type) {
+	case *VCDIFFPatch:
+		data = patch.data
+	case *PMSRPatch:
+		if patch.TargetSize < 0 {
+			return nil, ErrInvalidPatch
+		}
+		if len(patch.data) == 0 {
+			return nil, ErrUnsupported
+		}
+		data = patch.data
+	default:
+		data, err = p.MarshalBinary()
+	}
+	if err != nil {
 		return nil, err
 	}
-	working := source
-	var header []byte
-	fake := 0
-	if opts.RemoveHeader {
-		h, rom, _ := RemoveHeader(source, opts.SourceName)
-		if h != nil {
-			header = h
-			working = rom
-		}
-	} else if opts.AddHeader {
-		with, info := AddHeader(source, opts.SourceName)
-		if info != nil {
-			working = with
-			fake = info.Size
-		}
-	}
-	applyOptions := opts
-	// MaxOutputSize describes the final output. A temporary compatibility
-	// header is removed after patching, so allow that header only during the
-	// intermediate apply step and enforce the caller's limit again below.
-	if fake > 0 && applyOptions.MaxOutputSize != 0 {
-		if applyOptions.MaxOutputSize > ^uint64(0)-uint64(fake) {
-			applyOptions.MaxOutputSize = ^uint64(0)
-		} else {
-			applyOptions.MaxOutputSize += uint64(fake)
-		}
-	}
-	out, e := p.Apply(working, applyOptions)
-	if e != nil {
-		return nil, e
-	}
-	if header != nil {
-		if opts.FixChecksum {
-			FixROMChecksum(out, opts.SourceName)
-		}
-		if len(out) > int(^uint(0)>>1)-len(header) {
-			return nil, ErrOutputTooLarge
-		}
-		joined := make([]byte, len(header)+len(out))
-		copy(joined, header)
-		copy(joined[len(header):], out)
-		out = joined
-	} else if fake > 0 {
-		if len(out) < fake {
-			return nil, fmt.Errorf("%w: patched output is smaller than temporary header", ErrInvalidPatch)
-		}
-		out = append([]byte(nil), out[fake:]...)
-		if opts.FixChecksum {
-			FixROMChecksum(out, opts.SourceName)
-		}
-	} else if opts.FixChecksum {
-		FixROMChecksum(out, opts.SourceName)
-	}
-	if err := checkOutputSize(uint64(len(out)), len(source), opts); err != nil {
-		return nil, err
-	}
-	if e = reportProgress(opts, Progress{Phase: "complete", Format: p.Format(), Completed: int64(len(out)), Total: int64(len(out))}); e != nil {
-		return nil, e
-	}
-	return out, nil
+	return applyEncodedWithOptions(source, data, opts)
 }

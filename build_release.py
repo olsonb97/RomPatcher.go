@@ -181,7 +181,9 @@ def main() -> int:
             checksum_file.unlink()
 
         (staging / "checksums.txt").write_text(
-            "\n".join(sorted(checksums)) + "\n", encoding="ascii"
+            "\n".join(sorted(checksums, key=lambda line: line.split(maxsplit=1)[1]))
+            + "\n",
+            encoding="ascii",
         )
         shutil.rmtree(work)
         staging.rename(output)

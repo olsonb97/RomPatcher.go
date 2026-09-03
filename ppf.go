@@ -10,6 +10,8 @@ type ppfRecord struct {
 	offset     uint64
 	data, undo []byte
 }
+
+// PPFPatch is a parsed PPF patch.
 type PPFPatch struct {
 	Version          int
 	PatchDescription string
@@ -17,11 +19,14 @@ type PPFPatch struct {
 	BlockCheck       []byte
 	Undo             bool
 	InputSize        uint32
-	Records          []ppfRecord
+	records          []ppfRecord
 	FileID           string
 }
 
-func (*PPFPatch) Format() Format        { return FormatPPF }
+// Format implements Patch.
+func (*PPFPatch) Format() Format { return FormatPPF }
+
+// Description implements Patch.
 func (p *PPFPatch) Description() string { return p.PatchDescription }
 func (p *PPFPatch) blockOffset() int {
 	if p.Version == 3 && p.ImageType == 1 {
@@ -30,12 +35,14 @@ func (p *PPFPatch) blockOffset() int {
 	return 0x9320
 }
 func (p *PPFPatch) undoing(source []byte) bool {
-	if !p.Undo || len(p.Records) == 0 {
+	if !p.Undo || len(p.records) == 0 {
 		return false
 	}
-	r := p.Records[0]
+	r := p.records[0]
 	return r.offset <= uint64(len(source)) && uint64(len(r.data)) <= uint64(len(source))-r.offset && bytes.Equal(source[int(r.offset):int(r.offset)+len(r.data)], r.data)
 }
+
+// ValidateSource implements Patch.
 func (p *PPFPatch) ValidateSource(source []byte) bool {
 	undoing := p.undoing(source)
 	if !undoing {
@@ -50,7 +57,7 @@ func (p *PPFPatch) ValidateSource(source []byte) bool {
 		}
 	}
 	if p.Undo {
-		for _, r := range p.Records {
+		for _, r := range p.records {
 			if r.offset > uint64(len(source)) || uint64(len(r.data)) > uint64(len(source))-r.offset {
 				return false
 			}
@@ -65,6 +72,8 @@ func (p *PPFPatch) ValidateSource(source []byte) bool {
 	}
 	return true
 }
+
+// ValidationInfo implements Patch.
 func (p *PPFPatch) ValidationInfo() *ValidationInfo {
 	if p.InputSize == 0 && len(p.BlockCheck) == 0 && !p.Undo {
 		return nil
@@ -81,51 +90,13 @@ func (p *PPFPatch) ValidationInfo() *ValidationInfo {
 	}
 	return &ValidationInfo{Type: "PPF", Values: values}
 }
+
+// Apply implements Patch.
 func (p *PPFPatch) Apply(source []byte, options ApplyOptions) ([]byte, error) {
-	if options.Validate && !p.ValidateSource(source) {
-		return nil, ErrSourceMismatch
-	}
-	size := len(source)
-	for _, r := range p.Records {
-		end := r.offset + uint64(len(r.data))
-		if end < uint64(len(r.data)) {
-			return nil, ErrInvalidPatch
-		}
-		n, e := checkedInt(end)
-		if e != nil {
-			return nil, e
-		}
-		if n > size {
-			size = n
-		}
-	}
-	if err := checkOutputSize(uint64(size), len(source), options); err != nil {
-		return nil, err
-	}
-	out, e := resizedCopy(source, size)
-	if e != nil {
-		return nil, e
-	}
-	undoing := p.undoing(source)
-	for recordIndex, r := range p.Records {
-		if err := reportProgress(options, Progress{Phase: "apply", Format: p.Format(), Completed: int64(recordIndex), Total: int64(len(p.Records))}); err != nil {
-			return nil, err
-		}
-		start := int(r.offset)
-		data := r.data
-		if undoing {
-			data = r.undo
-		}
-		if len(data) != len(r.data) || start < 0 || start > len(out)-len(data) {
-			return nil, fmt.Errorf("%w: PPF record", ErrInvalidPatch)
-		}
-		copy(out[start:], data)
-	}
-	if err := reportProgress(options, Progress{Phase: "apply", Format: p.Format(), Completed: int64(len(p.Records)), Total: int64(len(p.Records))}); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return ApplyParsedWithOptions(source, p, options)
 }
+
+// MarshalBinary implements Patch.
 func (p *PPFPatch) MarshalBinary() ([]byte, error) {
 	if p.Version < 1 || p.Version > 3 {
 		return nil, fmt.Errorf("%w: PPF version", ErrInvalidPatch)
@@ -164,7 +135,7 @@ func (p *PPFPatch) MarshalBinary() ([]byte, error) {
 		}
 		out = append(out, p.BlockCheck...)
 	}
-	for _, r := range p.Records {
+	for _, r := range p.records {
 		if len(r.data) == 0 || len(r.data) > 255 {
 			return nil, fmt.Errorf("%w: PPF record length", ErrInvalidPatch)
 		}
@@ -334,46 +305,7 @@ func parsePPF(data []byte) (*PPFPatch, error) {
 			}
 			r.undo = append([]byte(nil), b...)
 		}
-		p.Records = append(p.Records, r)
+		p.records = append(p.records, r)
 	}
 	return p, nil
-}
-func createPPF(original, modified []byte) *PPFPatch {
-	p := &PPFPatch{Version: 3, PatchDescription: "Patch description"}
-	target := modified
-	if len(original) > len(modified) {
-		target = make([]byte, len(original))
-		copy(target, modified)
-	}
-	for pos := 0; pos < len(target); {
-		var a byte
-		if pos < len(original) {
-			a = original[pos]
-		}
-		if a == target[pos] {
-			pos++
-			continue
-		}
-		start := pos
-		buf := make([]byte, 0, 255)
-		for pos < len(target) && len(buf) < 255 {
-			a = 0
-			if pos < len(original) {
-				a = original[pos]
-			}
-			if a == target[pos] {
-				break
-			}
-			buf = append(buf, target[pos])
-			pos++
-		}
-		p.Records = append(p.Records, ppfRecord{offset: uint64(start), data: buf})
-	}
-	if len(original) < len(target) && target[len(target)-1] == 0 {
-		last := len(target) - 1
-		if len(p.Records) == 0 || int(p.Records[len(p.Records)-1].offset)+len(p.Records[len(p.Records)-1].data) <= last {
-			p.Records = append(p.Records, ppfRecord{offset: uint64(last), data: []byte{0}})
-		}
-	}
-	return p
 }

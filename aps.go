@@ -14,6 +14,8 @@ type apsRecord struct {
 	rleLen int
 	rle    byte
 }
+
+// APSN64Patch is a parsed APS patch for Nintendo 64 images.
 type APSN64Patch struct {
 	HeaderType, Encoding byte
 	PatchDescription     string
@@ -22,11 +24,11 @@ type APSN64Patch struct {
 	CartCRC              [8]byte
 	Pad                  [5]byte
 	TargetSize           uint32
-	Records              []apsRecord
+	records              []apsRecord
 }
 
 func (p *APSN64Patch) validateRecords() error {
-	for _, r := range p.Records {
+	for _, r := range p.records {
 		length := len(r.data)
 		if r.rleLen > 0 {
 			length = r.rleLen
@@ -38,60 +40,34 @@ func (p *APSN64Patch) validateRecords() error {
 	return nil
 }
 
-func (*APSN64Patch) Format() Format        { return FormatAPSN64 }
+// Format implements Patch.
+func (*APSN64Patch) Format() Format { return FormatAPSN64 }
+
+// Description implements Patch.
 func (p *APSN64Patch) Description() string { return p.PatchDescription }
+
+// ValidateSource implements Patch.
 func (p *APSN64Patch) ValidateSource(source []byte) bool {
 	if p.HeaderType != 1 {
 		return true
 	}
-	return len(source) >= 0x3f && string(source[0x3c:0x3f]) == p.CartID && len(source) >= 0x18 && bytes.Equal(source[0x10:0x18], p.CartCRC[:])
+	return len(source) >= 0x3f && strings.TrimRight(string(source[0x3c:0x3f]), "\x00") == p.CartID && bytes.Equal(source[0x10:0x18], p.CartCRC[:])
 }
+
+// ValidationInfo implements Patch.
 func (p *APSN64Patch) ValidationInfo() *ValidationInfo {
 	if p.HeaderType != 1 {
 		return nil
 	}
 	return &ValidationInfo{Type: "N64", Values: []string{fmt.Sprintf("%s (%x)", p.CartID, p.CartCRC)}}
 }
+
+// Apply implements Patch.
 func (p *APSN64Patch) Apply(source []byte, options ApplyOptions) ([]byte, error) {
-	if err := p.validateRecords(); err != nil {
-		return nil, err
-	}
-	if options.Validate && !p.ValidateSource(source) {
-		return nil, ErrSourceMismatch
-	}
-	if err := checkOutputSize(uint64(p.TargetSize), len(source), options); err != nil {
-		return nil, err
-	}
-	targetSize, e := checkedInt(uint64(p.TargetSize))
-	if e != nil {
-		return nil, e
-	}
-	out, e := resizedCopy(source, targetSize)
-	if e != nil {
-		return nil, e
-	}
-	for recordIndex, r := range p.Records {
-		if err := reportProgress(options, Progress{Phase: "apply", Format: p.Format(), Completed: int64(recordIndex), Total: int64(len(p.Records))}); err != nil {
-			return nil, err
-		}
-		ln := len(r.data)
-		if r.rleLen > 0 {
-			ln = r.rleLen
-		}
-		if r.offset < 0 || r.offset > len(out)-ln {
-			return nil, fmt.Errorf("%w: APS record outside output", ErrInvalidPatch)
-		}
-		if r.rleLen > 0 {
-			fillBytes(out[r.offset:r.offset+r.rleLen], r.rle)
-		} else {
-			copy(out[r.offset:], r.data)
-		}
-	}
-	if err := reportProgress(options, Progress{Phase: "apply", Format: p.Format(), Completed: int64(len(p.Records)), Total: int64(len(p.Records))}); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return ApplyParsedWithOptions(source, p, options)
 }
+
+// MarshalBinary implements Patch.
 func (p *APSN64Patch) MarshalBinary() ([]byte, error) {
 	if err := p.validateRecords(); err != nil {
 		return nil, err
@@ -106,7 +82,7 @@ func (p *APSN64Patch) MarshalBinary() ([]byte, error) {
 		out = append(out, p.Pad[:]...)
 	}
 	out = appendU32LE(out, p.TargetSize)
-	for _, r := range p.Records {
+	for _, r := range p.records {
 		if r.offset < 0 || uint64(r.offset) > uint64(^uint32(0)) {
 			return nil, ErrInvalidPatch
 		}
@@ -205,62 +181,12 @@ func parseAPSN64(data []byte) (*APSN64Patch, error) {
 			}
 			r.data = append([]byte(nil), b...)
 		}
-		p.Records = append(p.Records, r)
+		p.records = append(p.records, r)
 	}
 	if e := p.validateRecords(); e != nil {
 		return nil, e
 	}
 	return p, nil
-}
-func createAPSN64(original, modified []byte, sourceName string) *APSN64Patch {
-	p := &APSN64Patch{PatchDescription: "no description", TargetSize: uint32(len(modified))}
-	if len(original) >= 0x40 && bytes.Equal(original[:4], []byte{0x80, 0x37, 0x12, 0x40}) {
-		p.HeaderType = 1
-		p.OriginalFormat = 1
-		if extension(sourceName) == "v64" {
-			p.OriginalFormat = 0
-		}
-		p.CartID = string(original[0x3c:0x3f])
-		copy(p.CartCRC[:], original[0x10:0x18])
-	}
-	for pos := 0; pos < len(modified); {
-		var a byte
-		if pos < len(original) {
-			a = original[pos]
-		}
-		if a == modified[pos] {
-			pos++
-			continue
-		}
-		start := pos
-		buf := make([]byte, 0, 255)
-		first := modified[pos]
-		rle := true
-		for pos < len(modified) && len(buf) < 255 {
-			a = 0
-			if pos < len(original) {
-				a = original[pos]
-			}
-			if a == modified[pos] {
-				break
-			}
-			b := modified[pos]
-			buf = append(buf, b)
-			if b != first {
-				rle = false
-			}
-			pos++
-		}
-		r := apsRecord{offset: start}
-		if rle && len(buf) > 2 {
-			r.rleLen = len(buf)
-			r.rle = first
-		} else {
-			r.data = buf
-		}
-		p.Records = append(p.Records, r)
-	}
-	return p
 }
 
 type apsGBARecord struct {
@@ -268,14 +194,16 @@ type apsGBARecord struct {
 	sourceCRC, targetCRC uint16
 	xor                  []byte
 }
+
+// APSGBAPatch is a parsed APS patch for Game Boy Advance images.
 type APSGBAPatch struct {
 	basePatch
 	SourceSize, TargetSize uint32
-	Records                []apsGBARecord
+	records                []apsGBARecord
 }
 
 func (p *APSGBAPatch) validateRecords() error {
-	for _, r := range p.Records {
+	for _, r := range p.records {
 		end := uint64(r.offset) + apsGBABlockSize
 		if len(r.xor) != apsGBABlockSize || end > uint64(p.SourceSize) || end > uint64(p.TargetSize) {
 			return fmt.Errorf("%w: APS GBA block outside file", ErrInvalidPatch)
@@ -284,12 +212,15 @@ func (p *APSGBAPatch) validateRecords() error {
 	return nil
 }
 
+// Format implements Patch.
 func (*APSGBAPatch) Format() Format { return FormatAPSGBA }
+
+// ValidateSource implements Patch.
 func (p *APSGBAPatch) ValidateSource(source []byte) bool {
 	if len(source) != int(p.SourceSize) {
 		return false
 	}
-	for _, r := range p.Records {
+	for _, r := range p.records {
 		start := int(r.offset)
 		if start < 0 || start > len(source)-apsGBABlockSize || CRC16(source[start:start+apsGBABlockSize]) != r.sourceCRC {
 			return false
@@ -297,47 +228,18 @@ func (p *APSGBAPatch) ValidateSource(source []byte) bool {
 	}
 	return true
 }
+
+// ValidationInfo implements Patch.
 func (p *APSGBAPatch) ValidationInfo() *ValidationInfo {
 	return &ValidationInfo{Type: "size", Values: []string{fmt.Sprint(p.SourceSize)}}
 }
+
+// Apply implements Patch.
 func (p *APSGBAPatch) Apply(source []byte, options ApplyOptions) ([]byte, error) {
-	if err := p.validateRecords(); err != nil {
-		return nil, err
-	}
-	if options.Validate && !p.ValidateSource(source) {
-		return nil, ErrSourceMismatch
-	}
-	if err := checkOutputSize(uint64(p.TargetSize), len(source), options); err != nil {
-		return nil, err
-	}
-	targetSize, e := checkedInt(uint64(p.TargetSize))
-	if e != nil {
-		return nil, e
-	}
-	out, e := resizedCopy(source, targetSize)
-	if e != nil {
-		return nil, e
-	}
-	for recordIndex, r := range p.Records {
-		if err := reportProgress(options, Progress{Phase: "apply", Format: p.Format(), Completed: int64(recordIndex), Total: int64(len(p.Records))}); err != nil {
-			return nil, err
-		}
-		start := int(r.offset)
-		if start < 0 || start > len(out)-apsGBABlockSize || start > len(source)-apsGBABlockSize || len(r.xor) != apsGBABlockSize {
-			return nil, fmt.Errorf("%w: APS GBA block outside file", ErrInvalidPatch)
-		}
-		for i, x := range r.xor {
-			out[start+i] = source[start+i] ^ x
-		}
-		if options.Validate && CRC16(out[start:start+apsGBABlockSize]) != r.targetCRC {
-			return nil, ErrTargetMismatch
-		}
-	}
-	if err := reportProgress(options, Progress{Phase: "apply", Format: p.Format(), Completed: int64(len(p.Records)), Total: int64(len(p.Records))}); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return ApplyParsedWithOptions(source, p, options)
 }
+
+// MarshalBinary implements Patch.
 func (p *APSGBAPatch) MarshalBinary() ([]byte, error) {
 	if err := p.validateRecords(); err != nil {
 		return nil, err
@@ -345,7 +247,7 @@ func (p *APSGBAPatch) MarshalBinary() ([]byte, error) {
 	out := append([]byte{}, "APS1"...)
 	out = appendU32LE(out, p.SourceSize)
 	out = appendU32LE(out, p.TargetSize)
-	for _, r := range p.Records {
+	for _, r := range p.records {
 		if len(r.xor) != apsGBABlockSize {
 			return nil, ErrInvalidPatch
 		}
@@ -392,7 +294,7 @@ func parseAPSGBA(data []byte) (*APSGBAPatch, error) {
 			return nil, e
 		}
 		r.xor = append([]byte(nil), b...)
-		p.Records = append(p.Records, r)
+		p.records = append(p.records, r)
 	}
 	if e := p.validateRecords(); e != nil {
 		return nil, e

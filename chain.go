@@ -2,12 +2,14 @@ package rompatcher
 
 import "fmt"
 
+// ChainStep reports the result of one patch in an ordered chain.
 type ChainStep struct {
 	Index      int          `json:"index"`
 	Inspection Inspection   `json:"inspection"`
 	Output     ArtifactInfo `json:"output"`
 }
 
+// ChainResult contains ordered step reports and, for ApplyChain, output bytes.
 type ChainResult struct {
 	Output []byte      `json:"-"`
 	Steps  []ChainStep `json:"steps"`
@@ -35,7 +37,7 @@ func ApplyChain(source []byte, patches [][]byte, opts ApplyOptions) (ChainResult
 		if index+1 < len(patches) {
 			stepOptions.FixChecksum = false
 		}
-		current, err = ApplyParsedWithOptions(current, p, stepOptions)
+		current, err = Apply(current, data, stepOptions)
 		if err != nil {
 			return result, fmt.Errorf("patch %d (%s): %w", index+1, p.Format(), err)
 		}

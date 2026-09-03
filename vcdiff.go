@@ -24,6 +24,8 @@ type vcdWindow struct {
 	adler                                        *uint32
 	bodyStart, bodyEnd                           int
 }
+
+// VCDIFFPatch is a parsed VCDIFF/xdelta patch.
 type VCDIFFPatch struct {
 	basePatch
 	data        []byte
@@ -52,7 +54,10 @@ func (p *VCDIFFPatch) unsupportedSecondary(flags byte) error {
 	return fmt.Errorf("%w: VCDIFF uses %s secondary compression (ID %d, section flags 0x%02x)", ErrUnsupported, vcdSecondaryName(p.secondaryID), p.secondaryID, flags)
 }
 
-func (*VCDIFFPatch) Format() Format                 { return FormatVCDIFF }
+// Format implements Patch.
+func (*VCDIFFPatch) Format() Format { return FormatVCDIFF }
+
+// MarshalBinary reports that VCDIFF creation is unsupported.
 func (*VCDIFFPatch) MarshalBinary() ([]byte, error) { return nil, ErrUnsupported }
 
 func parseVCDIFF(data []byte) (*VCDIFFPatch, error) {
@@ -545,51 +550,7 @@ func (p *VCDIFFPatch) decodeTargetWindow(w vcdWindow, dataSection, instSection, 
 	return window, nil
 }
 
+// Apply implements Patch.
 func (p *VCDIFFPatch) Apply(source []byte, options ApplyOptions) ([]byte, error) {
-	d := newDecoder(p.data)
-	_ = d.seek(p.headerEnd)
-	out := make([]byte, 0)
-	decoders := new(vcdSecondaryDecoders)
-	windowIndex := int64(0)
-	for !d.eof() {
-		if err := reportProgress(options, Progress{Phase: "apply-window", Format: p.Format(), Completed: windowIndex}); err != nil {
-			return nil, err
-		}
-		w, err := decodeVCDWindow(d)
-		if err != nil {
-			return nil, err
-		}
-		if w.targetLength > int(^uint(0)>>1)-len(out) {
-			return nil, ErrInvalidPatch
-		}
-		if err := checkOutputSize(uint64(len(out))+uint64(w.targetLength), len(source), options); err != nil {
-			return nil, err
-		}
-		data, instructions, addresses, next, err := p.windowSections(w, decoders, options, uint64(len(source)))
-		if err != nil {
-			return nil, err
-		}
-		readExternal := func(dst []byte, offset int64, target bool) error {
-			input := source
-			if target {
-				input = out
-			}
-			if offset < 0 || offset > int64(len(input))-int64(len(dst)) {
-				return fmt.Errorf("%w: VCDIFF external copy", ErrInvalidPatch)
-			}
-			copy(dst, input[int(offset):int(offset)+len(dst)])
-			return nil
-		}
-		window, err := p.decodeTargetWindow(w, data, instructions, addresses, int64(len(out)), int64(len(source)), readExternal, options)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, window...)
-		_ = d.seek(next)
-		windowIndex++
-	}
-	if err := reportProgress(options, Progress{Phase: "apply-window", Format: p.Format(), Completed: windowIndex, Total: windowIndex}); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return ApplyParsedWithOptions(source, p, options)
 }

@@ -4,7 +4,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
-	"time"
 )
 
 type rupRecord struct {
@@ -18,40 +17,40 @@ type rupFile struct {
 	SourceMD5, TargetMD5   string
 	OverflowMode           byte
 	Overflow               []byte
-	Records                []rupRecord
+	records                []rupRecord
 }
+
+// RUPPatch is a parsed reversible NINJA2 RUP patch.
 type RUPPatch struct {
 	TextEncoding                                                         byte
 	Author, Version, Title, Genre, Language, Date, Web, PatchDescription string
-	Files                                                                []rupFile
+	files                                                                []rupFile
 }
 
-func (*RUPPatch) Format() Format        { return FormatRUP }
+// Format implements Patch.
+func (*RUPPatch) Format() Format { return FormatRUP }
+
+// Description implements Patch.
 func (p *RUPPatch) Description() string { return p.PatchDescription }
+
+// ValidateSource implements Patch and accepts either reversible endpoint.
 func (p *RUPPatch) ValidateSource(source []byte) bool {
 	sum := MD5(source)
-	for _, f := range p.Files {
+	for _, f := range p.files {
 		if sum == f.SourceMD5 || sum == f.TargetMD5 {
 			return true
 		}
 	}
 	return false
 }
+
+// ValidationInfo implements Patch.
 func (p *RUPPatch) ValidationInfo() *ValidationInfo {
-	v := make([]string, 0, len(p.Files)*2)
-	for _, f := range p.Files {
+	v := make([]string, 0, len(p.files)*2)
+	for _, f := range p.files {
 		v = append(v, f.SourceMD5, f.TargetMD5)
 	}
 	return &ValidationInfo{Type: "MD5", Values: v}
-}
-
-func (p *RUPPatch) matchingFile(sum string) (file *rupFile, undo bool) {
-	for i := range p.Files {
-		if sum == p.Files[i].SourceMD5 || sum == p.Files[i].TargetMD5 {
-			return &p.Files[i], sum == p.Files[i].TargetMD5
-		}
-	}
-	return nil, false
 }
 
 func validateRUPFile(f *rupFile) error {
@@ -78,7 +77,7 @@ func validateRUPFile(f *rupFile) error {
 	if uint64(len(f.Overflow)) > overflowSize {
 		return fmt.Errorf("%w: RUP overflow length", ErrInvalidPatch)
 	}
-	for _, r := range f.Records {
+	for _, r := range f.records {
 		length := uint64(len(r.xor))
 		if length == 0 || length > maximum || r.offset > maximum-length {
 			return fmt.Errorf("%w: RUP record outside file range", ErrInvalidPatch)
@@ -86,102 +85,10 @@ func validateRUPFile(f *rupFile) error {
 	}
 	return nil
 }
+
+// Apply implements Patch and automatically selects the reversible direction.
 func (p *RUPPatch) Apply(source []byte, options ApplyOptions) ([]byte, error) {
-	sum, err := md5Cancelable(source, options)
-	if err != nil {
-		return nil, err
-	}
-	f, undo := p.matchingFile(sum)
-	if f == nil {
-		if options.Validate {
-			return nil, ErrSourceMismatch
-		}
-		if len(p.Files) == 0 {
-			return nil, fmt.Errorf("%w: RUP has no files", ErrInvalidPatch)
-		}
-		f = &p.Files[0]
-	}
-	if e := validateRUPFile(f); e != nil {
-		return nil, e
-	}
-	size := f.TargetSize
-	if undo {
-		size = f.SourceSize
-	}
-	if err := checkOutputSize(size, len(source), options); err != nil {
-		return nil, err
-	}
-	n, e := checkedInt(size)
-	if e != nil {
-		return nil, e
-	}
-	out, e := resizedCopy(source, n)
-	if e != nil {
-		return nil, e
-	}
-	for recordIndex, r := range f.Records {
-		if err := reportProgress(options, Progress{Phase: "apply", Format: p.Format(), Completed: int64(recordIndex), Total: int64(len(f.Records))}); err != nil {
-			return nil, err
-		}
-		start, e := checkedInt(r.offset)
-		if e != nil {
-			return nil, e
-		}
-		if start >= len(out) {
-			continue
-		}
-		length := len(r.xor)
-		if len(out)-start < length {
-			length = len(out) - start
-		}
-		for i, x := range r.xor[:length] {
-			var b byte
-			if start+i < len(source) {
-				b = source[start+i]
-			}
-			out[start+i] = b ^ x
-		}
-	}
-	if err := reportProgress(options, Progress{Phase: "apply", Format: p.Format(), Completed: int64(len(f.Records)), Total: int64(len(f.Records))}); err != nil {
-		return nil, err
-	}
-	if f.OverflowMode == 'A' && !undo {
-		start, e := checkedInt(f.SourceSize)
-		if e != nil {
-			return nil, e
-		}
-		if start > len(out)-len(f.Overflow) {
-			return nil, ErrInvalidPatch
-		}
-		for i, b := range f.Overflow {
-			out[start+i] = b ^ 0xff
-		}
-	} else if f.OverflowMode == 'M' && undo {
-		start, e := checkedInt(f.TargetSize)
-		if e != nil {
-			return nil, e
-		}
-		if start > len(out)-len(f.Overflow) {
-			return nil, ErrInvalidPatch
-		}
-		for i, b := range f.Overflow {
-			out[start+i] = b ^ 0xff
-		}
-	}
-	if options.Validate {
-		want := f.TargetMD5
-		if undo {
-			want = f.SourceMD5
-		}
-		sum, err := md5Cancelable(out, options)
-		if err != nil {
-			return nil, err
-		}
-		if sum != want {
-			return nil, ErrTargetMismatch
-		}
-	}
-	return out, nil
+	return ApplyParsedWithOptions(source, p, options)
 }
 
 func readRUPVLV(d *decoder) (uint64, error) {
@@ -225,8 +132,9 @@ func md5Bytes(s string) ([]byte, error) {
 	return b, nil
 }
 
+// MarshalBinary implements Patch.
 func (p *RUPPatch) MarshalBinary() ([]byte, error) {
-	if len(p.Files) == 0 {
+	if len(p.files) == 0 {
 		return nil, fmt.Errorf("%w: RUP has no files", ErrInvalidPatch)
 	}
 	out := append([]byte{}, "NINJA2"...)
@@ -242,7 +150,7 @@ func (p *RUPPatch) MarshalBinary() ([]byte, error) {
 	if len(out) != 0x800 {
 		return nil, fmt.Errorf("%w: RUP header size", ErrInvalidPatch)
 	}
-	for _, f := range p.Files {
+	for _, f := range p.files {
 		if e := validateRUPFile(&f); e != nil {
 			return nil, e
 		}
@@ -270,7 +178,7 @@ func (p *RUPPatch) MarshalBinary() ([]byte, error) {
 			out = appendRUPVLV(out, uint64(len(f.Overflow)))
 			out = append(out, f.Overflow...)
 		}
-		for _, r := range f.Records {
+		for _, r := range f.records {
 			out = append(out, 2)
 			out = appendRUPVLV(out, r.offset)
 			out = appendRUPVLV(out, uint64(len(r.xor)))
@@ -331,12 +239,12 @@ func parseRUP(data []byte) (*RUPPatch, error) {
 				if e := validateRUPFile(current); e != nil {
 					return nil, e
 				}
-				p.Files = append(p.Files, *current)
+				p.files = append(p.files, *current)
 			}
 			if !d.eof() {
 				return nil, fmt.Errorf("%w: data after RUP end command", ErrInvalidPatch)
 			}
-			if len(p.Files) == 0 {
+			if len(p.files) == 0 {
 				return nil, fmt.Errorf("%w: RUP has no files", ErrInvalidPatch)
 			}
 			return p, nil
@@ -345,7 +253,7 @@ func parseRUP(data []byte) (*RUPPatch, error) {
 				if e := validateRUPFile(current); e != nil {
 					return nil, e
 				}
-				p.Files = append(p.Files, *current)
+				p.files = append(p.files, *current)
 			}
 			current = &rupFile{}
 			ln, e := readRUPVLV(d)
@@ -424,46 +332,10 @@ func parseRUP(data []byte) (*RUPPatch, error) {
 			if e != nil {
 				return nil, e
 			}
-			current.Records = append(current.Records, rupRecord{offset: off, xor: append([]byte(nil), b...)})
+			current.records = append(current.records, rupRecord{offset: off, xor: append([]byte(nil), b...)})
 		default:
 			return nil, fmt.Errorf("%w: RUP command 0x%02x", ErrInvalidPatch, cmd)
 		}
 	}
 	return nil, fmt.Errorf("%w: RUP end command missing", ErrInvalidPatch)
-}
-
-func createRUP(original, modified []byte, description string) *RUPPatch {
-	p := &RUPPatch{Date: time.Now().Format("20060102"), PatchDescription: description}
-	f := rupFile{SourceSize: uint64(len(original)), TargetSize: uint64(len(modified)), SourceMD5: MD5(original), TargetMD5: MD5(modified)}
-	a, b := original, modified
-	if len(a) < len(b) {
-		f.OverflowMode = 'A'
-		f.Overflow = make([]byte, len(b)-len(a))
-		for i, x := range b[len(a):] {
-			f.Overflow[i] = x ^ 0xff
-		}
-		b = b[:len(a)]
-	} else if len(a) > len(b) {
-		f.OverflowMode = 'M'
-		f.Overflow = make([]byte, len(a)-len(b))
-		for i, x := range a[len(b):] {
-			f.Overflow[i] = x ^ 0xff
-		}
-		a = a[:len(b)]
-	}
-	for pos := 0; pos < len(b); {
-		if a[pos] == b[pos] {
-			pos++
-			continue
-		}
-		start := pos
-		x := make([]byte, 0, 64)
-		for pos < len(b) && a[pos] != b[pos] {
-			x = append(x, a[pos]^b[pos])
-			pos++
-		}
-		f.Records = append(f.Records, rupRecord{offset: uint64(start), xor: x})
-	}
-	p.Files = []rupFile{f}
-	return p
 }

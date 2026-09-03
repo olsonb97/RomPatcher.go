@@ -118,20 +118,27 @@ func addApplyFlags(f *flag.FlagSet) *applyFlags {
 }
 
 func (o *applyFlags) options(ctx context.Context, sourceName string) rompatcher.ApplyOptions {
-	opts := rompatcher.ApplyOptions{Context: ctx, Validate: o.validate, RemoveHeader: o.remove, AddHeader: o.add, FixChecksum: o.fix, SourceName: sourceName, MaxOutputSize: o.maxOutput}
-	if o.progress {
-		opts.Progress = func(p rompatcher.Progress) {
-			if p.Total > 0 {
-				fmt.Fprintf(os.Stderr, "\r%s %d/%d", p.Phase, p.Completed, p.Total)
-			} else {
-				fmt.Fprintf(os.Stderr, "\r%s %d", p.Phase, p.Completed)
-			}
-			if p.Phase == "complete" {
-				fmt.Fprintln(os.Stderr)
-			}
+	return rompatcher.ApplyOptions{
+		Context: ctx, Validate: o.validate, RemoveHeader: o.remove, AddHeader: o.add,
+		FixChecksum: o.fix, SourceName: sourceName, MaxOutputSize: o.maxOutput,
+		Progress: progressPrinter(o.progress),
+	}
+}
+
+func progressPrinter(enabled bool) func(rompatcher.Progress) {
+	if !enabled {
+		return nil
+	}
+	return func(progress rompatcher.Progress) {
+		if progress.Total > 0 {
+			fmt.Fprintf(os.Stderr, "\r%s %d/%d", progress.Phase, progress.Completed, progress.Total)
+		} else {
+			fmt.Fprintf(os.Stderr, "\r%s %d", progress.Phase, progress.Completed)
+		}
+		if progress.Phase == "complete" {
+			fmt.Fprintln(os.Stderr)
 		}
 	}
-	return opts
 }
 
 func apply(ctx context.Context, args []string) error {
@@ -164,6 +171,9 @@ options:
 	if f.NArg() < 2 {
 		return errors.New("apply requires SOURCE PATCH [PATCH...]")
 	}
+	if o.remove && o.add {
+		return errors.New("--remove-header and --add-header cannot be used together")
+	}
 	sourcePath, patchPaths := f.Arg(0), f.Args()[1:]
 	stdinCount := 0
 	if sourcePath == "-" {
@@ -183,7 +193,10 @@ options:
 	}
 
 	outputPath := o.output
-	fileBacked := len(patchPaths) == 1 && sourcePath != "-" && patchPaths[0] != "-" && outputPath != "-"
+	fileBacked := sourcePath != "-" && outputPath != "-"
+	for _, path := range patchPaths {
+		fileBacked = fileBacked && path != "-"
+	}
 	if fileBacked && !o.dryRun {
 		materialSource, sourceName, cleanSource, err := materializeInput(sourcePath, o.sourceEntry, rompatcher.InputSource, 0)
 		if err != nil {
@@ -193,17 +206,27 @@ options:
 		if outputPath == "" {
 			outputPath = defaultOutputPath(sourcePath, sourceName)
 		}
-		patchEntry := patchEntries[0]
-		materialPatch, _, cleanPatch, err := materializeInput(patchPaths[0], patchEntry, rompatcher.InputPatch, 256<<20)
-		if err != nil {
-			return fmt.Errorf("patch: %w", err)
+		materialPatches := make([]string, 0, len(patchPaths))
+		for index, patchPath := range patchPaths {
+			materialPatch, _, cleanPatch, err := materializeInput(patchPath, patchEntries[index], rompatcher.InputPatch, 0)
+			if err != nil {
+				return fmt.Errorf("patch %d: %w", index+1, err)
+			}
+			defer cleanPatch()
+			materialPatches = append(materialPatches, materialPatch)
 		}
-		defer cleanPatch()
 		opts := o.options(ctx, sourceName)
-		if err := rompatcher.ApplyFileContext(ctx, materialSource, materialPatch, outputPath, opts); err != nil {
+		if len(materialPatches) == 1 {
+			if err := rompatcher.ApplyFileContext(ctx, materialSource, materialPatches[0], outputPath, opts); err != nil {
+				return err
+			}
+			return emit(o.jsonOutput, map[string]any{"status": "ok", "output": outputPath}, "patched ROM written to "+outputPath)
+		}
+		result, err := rompatcher.ApplyFileChainContext(ctx, materialSource, materialPatches, outputPath, opts)
+		if err != nil {
 			return err
 		}
-		return emit(o.jsonOutput, map[string]any{"status": "ok", "output": outputPath}, "patched ROM written to "+outputPath)
+		return emit(o.jsonOutput, map[string]any{"status": "ok", "output": outputPath, "steps": result.Steps}, "patched ROM written to "+outputPath)
 	}
 	if outputPath == "" && sourcePath == "-" && !o.dryRun {
 		return errors.New("stdin sources require -o/--output")
@@ -325,6 +348,40 @@ func batch(ctx context.Context, args []string) error {
 		if job.RemoveHeader && job.AddHeader {
 			return fmt.Errorf("job %d: removeHeader and addHeader cannot both be enabled", index+1)
 		}
+		if !*dryRun {
+			result, err := func() (rompatcher.ChainResult, error) {
+				sourcePath, sourceName, cleanSource, err := materializeInput(job.Source, job.SourceEntry, rompatcher.InputSource, 0)
+				if err != nil {
+					return rompatcher.ChainResult{}, fmt.Errorf("source: %w", err)
+				}
+				defer cleanSource()
+				patchPaths := make([]string, 0, len(job.Patches))
+				cleanups := make([]func(), 0, len(job.Patches))
+				defer func() {
+					for _, cleanup := range cleanups {
+						cleanup()
+					}
+				}()
+				for patchIndex, item := range job.Patches {
+					path, _, cleanup, err := materializeInput(item.Path, item.Entry, rompatcher.InputPatch, 0)
+					if err != nil {
+						return rompatcher.ChainResult{}, fmt.Errorf("patch %d: %w", patchIndex+1, err)
+					}
+					patchPaths = append(patchPaths, path)
+					cleanups = append(cleanups, cleanup)
+				}
+				return rompatcher.ApplyFileChainContext(ctx, sourcePath, patchPaths, job.Output, rompatcher.ApplyOptions{
+					Context: ctx, Validate: job.Validate, RemoveHeader: job.RemoveHeader,
+					AddHeader: job.AddHeader, FixChecksum: job.FixChecksum,
+					SourceName: sourceName, MaxOutputSize: job.MaxOutput,
+				})
+			}()
+			if err != nil {
+				return fmt.Errorf("job %d: %w", index+1, err)
+			}
+			results = append(results, result)
+			continue
+		}
 		source, sourceName, err := readInput(job.Source, job.SourceEntry, rompatcher.InputSource, 0)
 		if err != nil {
 			return fmt.Errorf("job %d source: %w", index+1, err)
@@ -345,11 +402,6 @@ func batch(ctx context.Context, args []string) error {
 		if err != nil {
 			return fmt.Errorf("job %d: %w", index+1, err)
 		}
-		if !*dryRun {
-			if err := rompatcher.WriteFileAtomic(job.Output, result.Output); err != nil {
-				return fmt.Errorf("job %d output: %w", index+1, err)
-			}
-		}
 		// The output bytes are intentionally excluded from JSON. Release each
 		// completed job before processing the next one instead of retaining all
 		// batch outputs in memory.
@@ -363,7 +415,7 @@ func create(ctx context.Context, args []string) error {
 	f := flag.NewFlagSet("create", flag.ContinueOnError)
 	format := f.String("format", "ips", "patch format: ips, ips32, ebp, ups, bps, aps, ppf, rup")
 	f.StringVar(format, "f", "ips", "alias for --format")
-	description := f.String("description", "", "patch description (RUP/EBP)")
+	description := f.String("description", "", "patch description or metadata")
 	f.StringVar(description, "d", "", "alias for --description")
 	author := f.String("author", "", "patch author (EBP)")
 	f.StringVar(author, "a", "", "alias for --author")
@@ -371,6 +423,11 @@ func create(ctx context.Context, args []string) error {
 	f.StringVar(title, "t", "", "alias for --title")
 	jsonOutput := f.Bool("json", false, "write machine-readable JSON")
 	f.BoolVar(jsonOutput, "j", false, "alias for --json")
+	progress := f.Bool("progress", false, "write progress updates to stderr")
+	f.BoolVar(progress, "p", false, "alias for --progress")
+	maxPatch := f.Uint64("max-patch", 0, "maximum patch size in bytes")
+	f.Uint64Var(maxPatch, "m", 0, "alias for --max-patch")
+	delta := f.Bool("delta", false, "use memory-intensive BPS delta matching")
 	outputFlag := f.String("output", "", "output patch; use - for stdout")
 	f.StringVar(outputFlag, "o", "", "alias for --output")
 	originalEntry := f.String("original-entry", "", "original entry inside a ZIP")
@@ -384,10 +441,13 @@ example:
 options:
   -f, --format FORMAT       ips, ips32, ebp, ups, bps, aps, ppf, or rup
   -o, --output FILE         output patch; use - for stdout
-  -d, --description TEXT    patch description
+  -d, --description TEXT    patch description or metadata
   -a, --author NAME         EBP author
   -t, --title TITLE         EBP title
   -j, --json                emit machine-readable JSON
+  -p, --progress            show progress on stderr
+  -m, --max-patch BYTES     reject larger patches
+      --delta               use memory-intensive BPS delta matching
       --original-entry NAME original entry inside a ZIP
       --modified-entry NAME modified entry inside a ZIP`)
 	}
@@ -400,19 +460,18 @@ options:
 	if f.Arg(0) == "-" && f.Arg(1) == "-" {
 		return errors.New("original and modified cannot both use stdin")
 	}
-	original, sourceName, err := readInput(f.Arg(0), *originalEntry, rompatcher.InputSource, 0)
-	if err != nil {
-		return err
+	formatName := strings.ToLower(strings.TrimSpace(*format))
+	if *delta && formatName != "bps" {
+		return errors.New("--delta is only valid with BPS creation")
 	}
-	modified, modifiedName, err := readInput(f.Arg(1), *modifiedEntry, rompatcher.InputSource, 0)
-	if err != nil {
-		return err
+	if formatName != "ebp" && (*author != "" || *title != "") {
+		return errors.New("--author and --title are only valid with EBP creation")
 	}
-	if err := ctx.Err(); err != nil {
-		return err
+	opts := &rompatcher.CreateOptions{
+		Context: ctx, Description: *description, BPSDelta: *delta,
+		MaxPatchSize: *maxPatch, Progress: progressPrinter(*progress),
 	}
-	opts := &rompatcher.CreateOptions{Description: *description, SourceName: sourceName}
-	if *format == "ebp" {
+	if formatName == "ebp" {
 		opts.Metadata = map[string]string{}
 		if *description != "" {
 			opts.Metadata["Description"] = *description
@@ -424,7 +483,48 @@ options:
 			opts.Metadata["Title"] = *title
 		}
 	}
-	p, err := rompatcher.Create(original, modified, rompatcher.Format(*format), opts)
+	if f.Arg(0) != "-" && f.Arg(1) != "-" && *outputFlag != "-" {
+		originalPath, sourceName, cleanOriginal, err := materializeInput(f.Arg(0), *originalEntry, rompatcher.InputSource, 0)
+		if err != nil {
+			return err
+		}
+		defer cleanOriginal()
+		modifiedPath, modifiedName, cleanModified, err := materializeInput(f.Arg(1), *modifiedEntry, rompatcher.InputSource, 0)
+		if err != nil {
+			return err
+		}
+		defer cleanModified()
+		opts.SourceName = sourceName
+		output := *outputFlag
+		if output == "" {
+			ext := filepath.Ext(modifiedName)
+			output = strings.TrimSuffix(filepath.Base(modifiedName), ext) + "." + formatName
+			if !isZIP(f.Arg(1)) {
+				output = filepath.Join(filepath.Dir(f.Arg(1)), output)
+			}
+		}
+		if err := rompatcher.CreateFileContext(ctx, originalPath, modifiedPath, output, rompatcher.Format(formatName), opts); err != nil {
+			return err
+		}
+		info, err := os.Stat(output)
+		if err != nil {
+			return err
+		}
+		return emit(*jsonOutput, map[string]any{"status": "ok", "output": output, "format": formatName, "size": info.Size()}, "patch written to "+output)
+	}
+	original, sourceName, err := readInput(f.Arg(0), *originalEntry, rompatcher.InputSource, 0)
+	if err != nil {
+		return err
+	}
+	modified, modifiedName, err := readInput(f.Arg(1), *modifiedEntry, rompatcher.InputSource, 0)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	opts.SourceName = sourceName
+	p, err := rompatcher.Create(original, modified, rompatcher.Format(formatName), opts)
 	if err != nil {
 		return err
 	}
@@ -438,7 +538,7 @@ options:
 			output = "-"
 		} else {
 			ext := filepath.Ext(modifiedName)
-			output = strings.TrimSuffix(filepath.Base(modifiedName), ext) + "." + *format
+			output = strings.TrimSuffix(filepath.Base(modifiedName), ext) + "." + formatName
 			if !isZIP(f.Arg(1)) {
 				output = filepath.Join(filepath.Dir(f.Arg(1)), output)
 			}
@@ -749,5 +849,12 @@ func parseInterspersed(f *flag.FlagSet, args []string) error {
 		i++
 		flags = append(flags, args[i])
 	}
-	return f.Parse(append(flags, positional...))
+	output := f.Output()
+	f.SetOutput(io.Discard)
+	err := f.Parse(append(flags, positional...))
+	f.SetOutput(output)
+	if errors.Is(err, flag.ErrHelp) {
+		f.Usage()
+	}
+	return err
 }

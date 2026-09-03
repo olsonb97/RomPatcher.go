@@ -1,6 +1,7 @@
 package rompatcher
 
 import (
+	"context"
 	"fmt"
 	"sort"
 )
@@ -19,111 +20,110 @@ type bpsAction struct {
 	relative int64
 }
 
+type bpsActionState struct {
+	position       uint64
+	sourceRelative uint64
+	targetRelative uint64
+}
+
+func addSignedOffset(position uint64, delta int64) (uint64, bool) {
+	if delta >= 0 {
+		amount := uint64(delta)
+		return position + amount, position <= ^uint64(0)-amount
+	}
+	amount := uint64(-(delta + 1)) + 1
+	return position - amount, position >= amount
+}
+
+func (s *bpsActionState) advance(actionType int, length uint64, relative int64, sourceSize, targetSize uint64) (uint64, error) {
+	if length == 0 || actionType < bpsSourceRead || actionType > bpsTargetCopy || length > targetSize || s.position > targetSize-length {
+		return 0, fmt.Errorf("%w: BPS action exceeds output", ErrInvalidPatch)
+	}
+	var copyPosition uint64
+	switch actionType {
+	case bpsSourceRead:
+		copyPosition = s.position
+		if length > sourceSize || copyPosition > sourceSize-length {
+			return 0, fmt.Errorf("%w: BPS source read exceeds input", ErrInvalidPatch)
+		}
+	case bpsSourceCopy:
+		var ok bool
+		copyPosition, ok = addSignedOffset(s.sourceRelative, relative)
+		if !ok || length > sourceSize || copyPosition > sourceSize-length {
+			return 0, fmt.Errorf("%w: BPS source copy exceeds input", ErrInvalidPatch)
+		}
+		s.sourceRelative = copyPosition + length
+	case bpsTargetCopy:
+		var ok bool
+		copyPosition, ok = addSignedOffset(s.targetRelative, relative)
+		if !ok || copyPosition >= s.position {
+			return 0, fmt.Errorf("%w: BPS target copy has no prior data", ErrInvalidPatch)
+		}
+		s.targetRelative = copyPosition + length
+	}
+	s.position += length
+	return copyPosition, nil
+}
+
+func (p *BPSPatch) validateActions() error {
+	state := bpsActionState{}
+	for _, action := range p.actions {
+		if action.length <= 0 {
+			return fmt.Errorf("%w: empty BPS action", ErrInvalidPatch)
+		}
+		if action.typ == bpsTargetRead && len(action.data) != action.length {
+			return fmt.Errorf("%w: BPS literal length", ErrInvalidPatch)
+		}
+		if _, err := state.advance(action.typ, uint64(action.length), action.relative, p.SourceSize, p.TargetSize); err != nil {
+			return err
+		}
+	}
+	if state.position != p.TargetSize {
+		return fmt.Errorf("%w: BPS actions produce %d bytes, expected %d", ErrInvalidPatch, state.position, p.TargetSize)
+	}
+	return nil
+}
+
+// BPSPatch is a parsed BPS patch.
 type BPSPatch struct {
 	SourceSize, TargetSize         uint64
 	Metadata                       string
-	Actions                        []bpsAction
+	actions                        []bpsAction
 	SourceCRC, TargetCRC, PatchCRC uint32
 }
 
-func (*BPSPatch) Format() Format        { return FormatBPS }
+// Format implements Patch.
+func (*BPSPatch) Format() Format { return FormatBPS }
+
+// Description implements Patch.
 func (p *BPSPatch) Description() string { return p.Metadata }
+
+// ValidateSource implements Patch.
 func (p *BPSPatch) ValidateSource(source []byte) bool {
 	return uint64(len(source)) == p.SourceSize && CRC32(source) == p.SourceCRC
 }
+
+// ValidationInfo implements Patch.
 func (p *BPSPatch) ValidationInfo() *ValidationInfo {
 	return &ValidationInfo{Type: "CRC32", Values: []string{fmt.Sprintf("%08x", p.SourceCRC)}}
 }
 
+// Apply implements Patch.
 func (p *BPSPatch) Apply(source []byte, options ApplyOptions) ([]byte, error) {
-	if options.Validate {
-		sum, err := crc32Cancelable(source, options)
-		if err != nil {
-			return nil, err
-		}
-		if uint64(len(source)) != p.SourceSize || sum != p.SourceCRC {
-			return nil, ErrSourceMismatch
-		}
-	}
-	if err := checkOutputSize(p.TargetSize, len(source), options); err != nil {
-		return nil, err
-	}
-	n, err := checkedInt(p.TargetSize)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]byte, n)
-	pos := 0
-	var sourceRel, targetRel int64
-	for i, a := range p.Actions {
-		if err := reportProgress(options, Progress{Phase: "apply", Format: p.Format(), Completed: int64(i), Total: int64(len(p.Actions))}); err != nil {
-			return nil, err
-		}
-		if a.length <= 0 || pos > len(out)-a.length {
-			return nil, fmt.Errorf("%w: BPS action exceeds output", ErrInvalidPatch)
-		}
-		switch a.typ {
-		case bpsSourceRead:
-			if pos > len(source)-a.length {
-				return nil, fmt.Errorf("%w: BPS source read exceeds input", ErrInvalidPatch)
-			}
-			copy(out[pos:pos+a.length], source[pos:pos+a.length])
-			pos += a.length
-		case bpsTargetRead:
-			if len(a.data) != a.length {
-				return nil, ErrInvalidPatch
-			}
-			copy(out[pos:], a.data)
-			pos += a.length
-		case bpsSourceCopy:
-			var ok bool
-			sourceRel, ok = addInt64(sourceRel, a.relative)
-			if !ok || sourceRel < 0 || int64(a.length) > int64(len(source))-sourceRel {
-				return nil, fmt.Errorf("%w: BPS source copy exceeds input", ErrInvalidPatch)
-			}
-			copy(out[pos:pos+a.length], source[int(sourceRel):int(sourceRel)+a.length])
-			sourceRel += int64(a.length)
-			pos += a.length
-		case bpsTargetCopy:
-			var ok bool
-			targetRel, ok = addInt64(targetRel, a.relative)
-			if !ok || targetRel < 0 || targetRel >= int64(pos) {
-				return nil, fmt.Errorf("%w: invalid BPS target copy", ErrInvalidPatch)
-			}
-			if !copyOverlapping(out, pos, int(targetRel), a.length) {
-				return nil, fmt.Errorf("%w: invalid BPS target copy", ErrInvalidPatch)
-			}
-			pos += a.length
-			targetRel += int64(a.length)
-		default:
-			return nil, fmt.Errorf("%w: BPS action type", ErrInvalidPatch)
-		}
-	}
-	if err := reportProgress(options, Progress{Phase: "apply", Format: p.Format(), Completed: int64(len(p.Actions)), Total: int64(len(p.Actions))}); err != nil {
-		return nil, err
-	}
-	if pos != len(out) {
-		return nil, fmt.Errorf("%w: BPS output is %d bytes, expected %d", ErrInvalidPatch, pos, len(out))
-	}
-	if options.Validate {
-		sum, err := crc32Cancelable(out, options)
-		if err != nil {
-			return nil, err
-		}
-		if sum != p.TargetCRC {
-			return nil, ErrTargetMismatch
-		}
-	}
-	return out, nil
+	return ApplyParsedWithOptions(source, p, options)
 }
 
+// MarshalBinary implements Patch.
 func (p *BPSPatch) MarshalBinary() ([]byte, error) {
+	if err := p.validateActions(); err != nil {
+		return nil, err
+	}
 	out := append([]byte{}, "BPS1"...)
 	out = appendBPSVLV(out, p.SourceSize)
 	out = appendBPSVLV(out, p.TargetSize)
 	out = appendBPSVLV(out, uint64(len(p.Metadata)))
 	out = append(out, p.Metadata...)
-	for _, a := range p.Actions {
+	for _, a := range p.actions {
 		if a.length <= 0 || a.typ < bpsSourceRead || a.typ > bpsTargetCopy {
 			return nil, fmt.Errorf("%w: empty BPS action", ErrInvalidPatch)
 		}
@@ -211,7 +211,7 @@ func parseBPS(data []byte) (*BPSPatch, error) {
 		if d.off > len(data)-12 {
 			return nil, ErrUnexpectedEnd
 		}
-		p.Actions = append(p.Actions, a)
+		p.actions = append(p.actions, a)
 	}
 	if d.off != len(data)-12 {
 		return nil, fmt.Errorf("%w: BPS footer boundary", ErrInvalidPatch)
@@ -231,63 +231,22 @@ func parseBPS(data []byte) (*BPSPatch, error) {
 	if CRC32(data[:len(data)-4]) != p.PatchCRC {
 		return nil, ErrPatchMismatch
 	}
+	if err := p.validateActions(); err != nil {
+		return nil, err
+	}
 	return p, nil
 }
 
-func createBPS(original, modified []byte, delta bool) *BPSPatch {
-	p := &BPSPatch{SourceSize: uint64(len(original)), TargetSize: uint64(len(modified)), SourceCRC: CRC32(original), TargetCRC: CRC32(modified)}
-	if delta {
-		p.Actions = createBPSDelta(original, modified)
-	} else {
-		p.Actions = createBPSLinear(original, modified)
+func createBPSDeltaPatch(original, modified []byte, opts CreateOptions) (*BPSPatch, error) {
+	ctx := createContext(opts)
+	actions, err := createBPSDelta(ctx, original, modified, func(completed, total int64) error {
+		return reportCreate(opts, FormatBPS, completed, total)
+	})
+	if err != nil {
+		return nil, err
 	}
-	b, _ := p.MarshalBinary()
-	p.PatchCRC = CRC32(b[:len(b)-4])
-	return p
-}
-
-func createBPSLinear(source, target []byte) []bpsAction {
-	actions := make([]bpsAction, 0)
-	output, targetRelative, readStart := 0, 0, -1
-	flush := func() {
-		if readStart >= 0 {
-			data := append([]byte(nil), target[readStart:output]...)
-			actions = append(actions, bpsAction{typ: bpsTargetRead, length: len(data), data: data})
-			readStart = -1
-		}
-	}
-	for output < len(target) {
-		sourceLen := 0
-		for output+sourceLen < len(source) && output+sourceLen < len(target) && source[output+sourceLen] == target[output+sourceLen] {
-			sourceLen++
-		}
-		rleLen := 0
-		for output+rleLen+1 < len(target) && target[output] == target[output+rleLen+1] {
-			rleLen++
-		}
-		if rleLen >= 4 {
-			if readStart < 0 {
-				readStart = output
-			}
-			output++
-			flush()
-			start := output - 1
-			actions = append(actions, bpsAction{typ: bpsTargetCopy, length: rleLen, relative: int64(start - targetRelative)})
-			output += rleLen
-			targetRelative = output - 1
-		} else if sourceLen >= 4 {
-			flush()
-			actions = append(actions, bpsAction{typ: bpsSourceRead, length: sourceLen})
-			output += sourceLen
-		} else {
-			if readStart < 0 {
-				readStart = output
-			}
-			output++
-		}
-	}
-	flush()
-	return actions
+	p := &BPSPatch{SourceSize: uint64(len(original)), TargetSize: uint64(len(modified)), Metadata: opts.Description, SourceCRC: CRC32(original), TargetCRC: CRC32(modified), actions: actions}
+	return p, nil
 }
 
 func bpsSymbol(data []byte, off int) uint16 {
@@ -302,12 +261,17 @@ func bpsSymbol(data []byte, off int) uint16 {
 // data can contain millions of identical two-byte symbols; scanning every
 // occurrence makes otherwise small BPS creation quadratic without improving
 // the result once a nearby long match is available.
-func bestBPSMatch(haystack, target []byte, targetOffset int, positions []int, bestLength int) (length, offset int) {
+func bestBPSMatch(ctx context.Context, haystack, target []byte, targetOffset int, positions []int, bestLength int) (length, offset int, err error) {
 	const candidateLimit = 64
 	length = bestLength
 	center := sort.SearchInts(positions, targetOffset)
 	left, right := center-1, center
 	for examined := 0; examined < candidateLimit && (left >= 0 || right < len(positions)); examined++ {
+		if examined&7 == 0 {
+			if err := ctx.Err(); err != nil {
+				return 0, 0, err
+			}
+		}
 		var candidate int
 		if left >= 0 && (right >= len(positions) || targetOffset-positions[left] <= positions[right]-targetOffset) {
 			candidate = positions[left]
@@ -321,6 +285,11 @@ func bestBPSMatch(haystack, target []byte, targetOffset int, positions []int, be
 			x++
 			y++
 			n++
+			if n&((64<<10)-1) == 0 {
+				if err := ctx.Err(); err != nil {
+					return 0, 0, err
+				}
+			}
 		}
 		if n > length {
 			length, offset = n, candidate
@@ -329,12 +298,18 @@ func bestBPSMatch(haystack, target []byte, targetOffset int, positions []int, be
 			}
 		}
 	}
-	return length, offset
+	return length, offset, nil
 }
 
-func createBPSDelta(source, target []byte) []bpsAction {
+func createBPSDelta(ctx context.Context, source, target []byte, progress func(int64, int64) error) ([]bpsAction, error) {
+	total := int64(len(source)) + int64(len(target))
 	sourceTree := make(map[uint16][]int)
 	for i := range source {
+		if i&(fileChunkSize-1) == 0 {
+			if err := progress(int64(i), total); err != nil {
+				return nil, err
+			}
+		}
 		sym := bpsSymbol(source, i)
 		sourceTree[sym] = append(sourceTree[sym], i)
 	}
@@ -349,6 +324,11 @@ func createBPSDelta(source, target []byte) []bpsAction {
 		}
 	}
 	for output < len(target) {
+		if output&(fileChunkSize-1) == 0 {
+			if err := progress(int64(len(source)+output), total); err != nil {
+				return nil, err
+			}
+		}
 		maxLen, maxOff, mode := 0, 0, bpsTargetRead
 		sym := bpsSymbol(target, output)
 		ln := 0
@@ -359,11 +339,15 @@ func createBPSDelta(source, target []byte) []bpsAction {
 			maxLen, mode = ln, bpsSourceRead
 		}
 		positions := sourceTree[sym]
-		if length, offset := bestBPSMatch(source, target, output, positions, maxLen); length > maxLen {
+		if length, offset, err := bestBPSMatch(ctx, source, target, output, positions, maxLen); err != nil {
+			return nil, err
+		} else if length > maxLen {
 			maxLen, maxOff, mode = length, offset, bpsSourceCopy
 		}
 		positions = targetTree[sym]
-		if length, offset := bestBPSMatch(target, target, output, positions, maxLen); length > maxLen {
+		if length, offset, err := bestBPSMatch(ctx, target, target, output, positions, maxLen); err != nil {
+			return nil, err
+		} else if length > maxLen {
 			maxLen, maxOff, mode = length, offset, bpsTargetCopy
 		}
 		targetTree[sym] = append(targetTree[sym], output)
@@ -391,5 +375,8 @@ func createBPSDelta(source, target []byte) []bpsAction {
 		output += maxLen
 	}
 	flush()
-	return actions
+	if err := progress(total, total); err != nil {
+		return nil, err
+	}
+	return actions, nil
 }

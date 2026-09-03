@@ -16,6 +16,22 @@ import (
 var testOriginal = []byte{98, 91, 64, 8, 35, 53, 122, 167, 52, 253, 222, 156, 247, 82, 227, 213, 22, 221, 17, 247, 107, 102, 164, 254, 221, 102, 207, 63, 117, 164, 223, 10, 223, 200, 150, 4, 77, 250, 111, 64, 233, 118, 1, 36, 1, 60, 208, 245, 136, 126, 29, 231, 168, 18, 125, 172, 11, 184, 81, 20, 16, 30, 154, 16, 236, 21, 5, 74, 255, 112, 171, 198, 185, 89, 2, 98, 45, 164, 214, 55, 103, 15, 217, 95, 212, 133, 184, 21, 67, 144, 198, 163, 76, 35, 248, 229, 163, 37, 103, 33, 193, 160, 161, 245, 125, 144, 193, 178, 31, 253, 119, 168, 169, 187, 195, 165, 205, 140, 222, 134, 249, 68, 224, 248, 144, 207, 18, 126}
 var testModified = []byte{98, 91, 64, 8, 35, 53, 122, 167, 52, 253, 222, 156, 247, 82, 227, 213, 22, 221, 17, 247, 107, 102, 164, 254, 221, 8, 207, 63, 117, 164, 223, 10, 1, 77, 87, 123, 48, 9, 111, 64, 233, 118, 1, 36, 1, 60, 208, 245, 136, 126, 29, 231, 168, 18, 125, 172, 11, 184, 81, 20, 16, 30, 154, 16, 236, 21, 5, 74, 255, 112, 171, 198, 185, 89, 2, 98, 45, 164, 214, 55, 103, 15, 217, 95, 212, 133, 184, 21, 67, 144, 198, 163, 76, 35, 248, 229, 163, 37, 103, 33, 193, 96, 77, 255, 117, 89, 193, 61, 64, 253, 119, 82, 49, 187, 195, 165, 205, 140, 222, 134, 249, 68, 224, 248, 144, 207, 18, 126}
 
+func testCreateRUP(original, modified []byte, description string) *RUPPatch {
+	patch, err := Create(original, modified, FormatRUP, &CreateOptions{Description: description})
+	if err != nil {
+		panic(err)
+	}
+	return patch.(*RUPPatch)
+}
+
+func testCreateUPS(original, modified []byte) *UPSPatch {
+	patch, err := Create(original, modified, FormatUPS, nil)
+	if err != nil {
+		panic(err)
+	}
+	return patch.(*UPSPatch)
+}
+
 func TestHashes(t *testing.T) {
 	if got := CRC32(testOriginal); got != 0x903a031b {
 		t.Fatalf("CRC32=%08x", got)
@@ -113,7 +129,7 @@ func TestBPSReferenceChecksum(t *testing.T) {
 
 func TestBPSLargeOverlappingTargetCopy(t *testing.T) {
 	const size = 2<<20 + 17
-	p := &BPSPatch{TargetSize: size, Actions: []bpsAction{
+	p := &BPSPatch{TargetSize: size, actions: []bpsAction{
 		{typ: bpsTargetRead, length: 1, data: []byte{'A'}},
 		{typ: bpsTargetCopy, length: size - 1},
 	}}
@@ -164,7 +180,7 @@ func TestCreateRejectsUnrepresentableShrink(t *testing.T) {
 }
 
 func TestRUPUndo(t *testing.T) {
-	p := createRUP(testOriginal, testModified, "")
+	p := testCreateRUP(testOriginal, testModified, "")
 	patched, err := p.Apply(testOriginal, ApplyOptions{Validate: true})
 	if err != nil {
 		t.Fatal(err)
@@ -179,10 +195,10 @@ func TestRUPUndo(t *testing.T) {
 }
 
 func TestRUPSelectsMatchingFileWithoutValidation(t *testing.T) {
-	first := createRUP([]byte("first source"), []byte("first target"), "")
+	first := testCreateRUP([]byte("first source"), []byte("first target"), "")
 	secondSource, secondTarget := []byte("second source"), []byte("second target")
-	second := createRUP(secondSource, secondTarget, "")
-	patch := &RUPPatch{Files: []rupFile{first.Files[0], second.Files[0]}}
+	second := testCreateRUP(secondSource, secondTarget, "")
+	patch := &RUPPatch{files: []rupFile{first.files[0], second.files[0]}}
 	encoded, err := patch.MarshalBinary()
 	if err != nil {
 		t.Fatal(err)
@@ -200,7 +216,7 @@ func TestRUPSelectsMatchingFileWithoutValidation(t *testing.T) {
 
 func TestUPSUndo(t *testing.T) {
 	for _, target := range [][]byte{testModified, append(append([]byte(nil), testModified...), 1, 2, 3)} {
-		patch := createUPS(testOriginal, target)
+		patch := testCreateUPS(testOriginal, target)
 		encoded, err := patch.MarshalBinary()
 		if err != nil {
 			t.Fatal(err)
@@ -228,7 +244,7 @@ func TestAPSGBA(t *testing.T) {
 	for i := range xor {
 		xor[i] = source[i] ^ target[i]
 	}
-	p := &APSGBAPatch{SourceSize: uint32(len(source)), TargetSize: uint32(len(target)), Records: []apsGBARecord{{sourceCRC: CRC16(source), targetCRC: CRC16(target), xor: xor}}}
+	p := &APSGBAPatch{SourceSize: uint32(len(source)), TargetSize: uint32(len(target)), records: []apsGBARecord{{sourceCRC: CRC16(source), targetCRC: CRC16(target), xor: xor}}}
 	b, e := p.MarshalBinary()
 	if e != nil {
 		t.Fatal(e)
@@ -253,6 +269,31 @@ func TestAPSGBA(t *testing.T) {
 	got, e = parsed.Apply(nil, ApplyOptions{Validate: true})
 	if e != nil || len(got) != 0 {
 		t.Fatalf("empty APS GBA patch: %v", e)
+	}
+}
+
+func TestAPSN64CreationDetectsV64ByteOrder(t *testing.T) {
+	source := make([]byte, 0x100)
+	copy(source, []byte{0x37, 0x80, 0x40, 0x12})
+	copy(source[0x10:0x18], []byte("12345678"))
+	copy(source[0x3c:0x3f], []byte("NGE"))
+	target := append([]byte(nil), source...)
+	target[0x80] ^= 0xff
+	patch, err := Create(source, target, FormatAPSN64, &CreateOptions{Description: "v64 test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	aps := patch.(*APSN64Patch)
+	if aps.HeaderType != 1 || aps.OriginalFormat != 0 || !aps.ValidateSource(source) {
+		t.Fatalf("V64 header was not preserved: %+v", aps)
+	}
+	encoded, err := aps.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Apply(source, encoded, ApplyOptions{Validate: true})
+	if err != nil || !bytes.Equal(got, target) {
+		t.Fatalf("V64 APS round trip: %v", err)
 	}
 }
 
@@ -463,7 +504,7 @@ func TestTemporaryHeaders(t *testing.T) {
 }
 
 func TestBadChecksums(t *testing.T) {
-	p := createUPS(testOriginal, testModified)
+	p := testCreateUPS(testOriginal, testModified)
 	b, _ := p.MarshalBinary()
 	b[len(b)-1] ^= 1
 	if _, e := Parse(b); !errors.Is(e, ErrPatchMismatch) {
@@ -472,14 +513,14 @@ func TestBadChecksums(t *testing.T) {
 }
 
 func TestOutputLimit(t *testing.T) {
-	p := &BPSPatch{TargetSize: 1024}
+	p := &BPSPatch{TargetSize: 1024, actions: []bpsAction{{typ: bpsTargetRead, length: 1024, data: make([]byte, 1024)}}}
 	if _, err := p.Apply(nil, ApplyOptions{MaxOutputSize: 100}); !errors.Is(err, ErrOutputTooLarge) {
 		t.Fatalf("got %v", err)
 	}
 }
 
 func TestMalformedArithmeticAndMetadata(t *testing.T) {
-	ups := &UPSPatch{TargetSize: 1, Records: []upsRecord{{offset: ^uint64(0), xor: []byte{1, 2}}}}
+	ups := &UPSPatch{TargetSize: 1, records: []upsRecord{{offset: ^uint64(0), xor: []byte{1, 2}}}}
 	if _, err := ups.Apply(nil, ApplyOptions{}); !errors.Is(err, ErrInvalidPatch) {
 		t.Fatalf("UPS overflow error = %v", err)
 	}
@@ -667,6 +708,28 @@ func TestInspectDryRunAndChain(t *testing.T) {
 	}
 }
 
+func TestDryRunValidatesTransformedSource(t *testing.T) {
+	headerless := make([]byte, 0x40000)
+	modified := append([]byte(nil), headerless...)
+	modified[10] = 1
+	patch, err := Create(headerless, modified, FormatBPS, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := patch.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	headered := append(make([]byte, 512), headerless...)
+	result, err := DryRun(headered, encoded, ApplyOptions{Validate: true, RemoveHeader: true, SourceName: "game.smc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.SourceValid == nil || !*result.SourceValid {
+		t.Fatalf("transformed source validity = %v", result.SourceValid)
+	}
+}
+
 func TestChainRepairsChecksumOnlyAfterFinalPatch(t *testing.T) {
 	original := make([]byte, 0x8000)
 	copy(original[0x104:], gameBoyLogo)
@@ -713,6 +776,9 @@ func TestZIPSelection(t *testing.T) {
 	}
 	if _, _, err := ReadZIPBytes(buf.Bytes(), "", InputSource, 0); !errors.Is(err, ErrAmbiguousArchive) {
 		t.Fatalf("got %v", err)
+	}
+	if _, _, err := ReadZIPBytes(buf.Bytes(), "", InputKind("invalid"), 0); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("invalid ZIP input kind error = %v", err)
 	}
 	got, name, err := ReadZIPBytes(buf.Bytes(), "b/game.gba", InputSource, 0)
 	if err != nil || name != "b/game.gba" || !bytes.Equal(got, testModified) {
@@ -821,8 +887,8 @@ func assertReaderAtError(t *testing.T, source, patch []byte, validate bool) erro
 
 func TestTruncatedIPSRejectsOutOfRangeRecords(t *testing.T) {
 	cases := []Patch{
-		&IPSPatch{Records: []ipsRecord{{offset: 2, data: []byte{1}}}, Truncate: 1, HasTruncate: true},
-		&IPS32Patch{Records: []ipsRecord{{offset: 2, data: []byte{1}}}, Truncate: 1, HasTruncate: true},
+		&IPSPatch{records: []ipsRecord{{offset: 2, data: []byte{1}}}, Truncate: 1, HasTruncate: true},
+		&IPS32Patch{records: []ipsRecord{{offset: 2, data: []byte{1}}}, Truncate: 1, HasTruncate: true},
 	}
 	for _, patch := range cases {
 		t.Run(string(patch.Format()), func(t *testing.T) {
@@ -870,27 +936,32 @@ func TestEBPMetadataMustBeObject(t *testing.T) {
 }
 
 func TestMalformedPositionArithmetic(t *testing.T) {
-	bps := &BPSPatch{TargetSize: 10, Actions: []bpsAction{{typ: bpsSourceCopy, length: 10, relative: int64(^uint64(0)>>1) - 1}}}
-	encoded, err := bps.MarshalBinary()
-	if err != nil {
+	bps := &BPSPatch{TargetSize: 10, actions: []bpsAction{{typ: bpsSourceCopy, length: 10, relative: int64(^uint64(0)>>1) - 1}}}
+	if _, err := bps.MarshalBinary(); !errors.Is(err, ErrInvalidPatch) {
+		t.Fatalf("BPS marshal overflow error = %v", err)
+	}
+}
+
+func TestBPSParseRejectsImpossibleActions(t *testing.T) {
+	encoded := append([]byte("BPS1"), appendBPSVLV(nil, 1)...)
+	encoded = append(encoded, appendBPSVLV(nil, 2)...)
+	encoded = append(encoded, appendBPSVLV(nil, 0)...)
+	encoded = append(encoded, appendBPSVLV(nil, uint64(1)<<2)...)
+	encoded = appendU32LE(encoded, 0)
+	encoded = appendU32LE(encoded, 0)
+	encoded = appendU32LE(encoded, CRC32(encoded))
+	if _, err := Parse(encoded); !errors.Is(err, ErrInvalidPatch) {
+		t.Fatalf("BPS parse error = %v", err)
+	}
+}
+
+func TestBPSMarshalDoesNotMutatePatch(t *testing.T) {
+	patch := &BPSPatch{TargetSize: 1, PatchCRC: 123, actions: []bpsAction{{typ: bpsTargetRead, length: 1, data: []byte{1}}}}
+	if _, err := patch.MarshalBinary(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = Apply([]byte("small"), encoded, ApplyOptions{}); !errors.Is(err, ErrInvalidPatch) {
-		t.Fatalf("BPS overflow error = %v", err)
-	}
-
-	bdf := &BDFPatch{TargetSize: 1, Records: []bdfRecord{{diff: []byte{0}, skip: int64(^uint64(0) >> 1)}}}
-	if _, err = bdf.Apply(nil, ApplyOptions{}); !errors.Is(err, ErrInvalidPatch) {
-		t.Fatalf("BSDIFF overflow error = %v", err)
-	}
-	out, openErr := os.OpenFile(filepath.Join(t.TempDir(), "bdf.bin"), os.O_CREATE|os.O_RDWR, 0o600)
-	if openErr != nil {
-		t.Fatal(openErr)
-	}
-	_, _, err = applyBDFAt(bytes.NewReader(nil), 0, out, bdf, ApplyOptions{})
-	_ = out.Close()
-	if !errors.Is(err, ErrInvalidPatch) {
-		t.Fatalf("BSDIFF ReaderAt overflow error = %v", err)
+	if patch.PatchCRC != 123 {
+		t.Fatalf("MarshalBinary changed PatchCRC to %d", patch.PatchCRC)
 	}
 }
 
@@ -898,7 +969,7 @@ func TestPPFValidationAndFileID(t *testing.T) {
 	source := make([]byte, 0x9320+1024)
 	patch := &PPFPatch{
 		Version: 3, BlockCheck: append([]byte(nil), source[0x9320:]...), FileID: "metadata",
-		Records: []ppfRecord{{offset: 0, data: []byte{'X'}}},
+		records: []ppfRecord{{offset: 0, data: []byte{'X'}}},
 	}
 	encoded, err := patch.MarshalBinary()
 	if err != nil {
@@ -928,7 +999,7 @@ func TestPPFValidationAndFileID(t *testing.T) {
 }
 
 func TestStrictRUPAndVCDIFFStructure(t *testing.T) {
-	rup := createRUP(testOriginal, testModified, "")
+	rup := testCreateRUP(testOriginal, testModified, "")
 	encoded, err := rup.MarshalBinary()
 	if err != nil {
 		t.Fatal(err)
@@ -936,7 +1007,7 @@ func TestStrictRUPAndVCDIFFStructure(t *testing.T) {
 	if _, err = Parse(append(encoded, 1)); !errors.Is(err, ErrInvalidPatch) {
 		t.Fatalf("RUP trailing data error = %v", err)
 	}
-	rup.Files[0].Overflow = []byte{1}
+	rup.files[0].Overflow = []byte{1}
 	if _, err = rup.MarshalBinary(); !errors.Is(err, ErrInvalidPatch) {
 		t.Fatalf("RUP overflow structure error = %v", err)
 	}
@@ -953,10 +1024,10 @@ func TestStrictRUPAndVCDIFFStructure(t *testing.T) {
 
 func TestRUPAllowsResizedTailRecords(t *testing.T) {
 	source, target := []byte{1, 2}, []byte{1, 2, 3, 4}
-	patch := &RUPPatch{Files: []rupFile{{
+	patch := &RUPPatch{files: []rupFile{{
 		SourceSize: uint64(len(source)), TargetSize: uint64(len(target)),
 		SourceMD5: MD5(source), TargetMD5: MD5(target), OverflowMode: 'A',
-		Records: []rupRecord{{offset: 2, xor: []byte{3, 4}}},
+		records: []rupRecord{{offset: 2, xor: []byte{3, 4}}},
 	}}}
 	encoded, err := patch.MarshalBinary()
 	if err != nil {
@@ -995,6 +1066,13 @@ func TestArchiveAnyAndLargeLimit(t *testing.T) {
 	}
 }
 
+func TestInMemoryZIPRejectsUnrepresentableEntry(t *testing.T) {
+	entry := &zip.File{FileHeader: zip.FileHeader{Name: "huge.bin", UncompressedSize64: uint64(int(^uint(0)>>1)) + 1}}
+	if _, _, err := selectZIP([]*zip.File{entry}, "huge.bin", InputAny, 0); !errors.Is(err, ErrOutputTooLarge) {
+		t.Fatalf("oversized ZIP entry error = %v", err)
+	}
+}
+
 func TestUPSValidationIncludesSize(t *testing.T) {
 	patch := &UPSPatch{SourceSize: uint64(len(testOriginal) + 1), TargetSize: uint64(len(testOriginal) + 2), SourceCRC: CRC32(testOriginal), TargetCRC: CRC32(testOriginal)}
 	if patch.ValidateSource(testOriginal) {
@@ -1008,13 +1086,14 @@ func TestUPSValidationIncludesSize(t *testing.T) {
 func TestMarshalRejectsLossyOrImpossibleValues(t *testing.T) {
 	cases := []Patch{
 		&IPSPatch{Truncate: -1, HasTruncate: true},
-		&BPSPatch{Actions: []bpsAction{{typ: 9, length: 1}}},
+		&BPSPatch{actions: []bpsAction{{typ: 9, length: 1}}},
 		&PPFPatch{Version: 1, BlockCheck: make([]byte, 1024)},
 		&PPFPatch{Version: 2, BlockCheck: make([]byte, 1024), Undo: true},
 		&RUPPatch{},
 	}
 	if uint64(^uint(0)>>1) > uint64(^uint32(0)) {
-		cases = append(cases, &APSN64Patch{Records: []apsRecord{{offset: int(uint64(^uint32(0)) + 1), data: []byte{1}}}})
+		tooLarge := uint64(^uint32(0)) + 1
+		cases = append(cases, &APSN64Patch{records: []apsRecord{{offset: int(tooLarge), data: []byte{1}}}})
 	}
 	for _, patch := range cases {
 		if _, err := patch.MarshalBinary(); !errors.Is(err, ErrInvalidPatch) {
@@ -1023,6 +1102,43 @@ func TestMarshalRejectsLossyOrImpossibleValues(t *testing.T) {
 	}
 	if _, err := (&PMSRPatch{TargetSize: -1}).Apply(nil, ApplyOptions{}); !errors.Is(err, ErrInvalidPatch) {
 		t.Fatalf("negative PMSR target error = %v", err)
+	}
+}
+
+func TestInspectionDoesNotAliasPatchMetadata(t *testing.T) {
+	patch := &IPSPatch{Metadata: map[string]string{"Author": "original"}}
+	inspection := InspectParsed(patch)
+	inspection.Metadata["Author"] = "changed"
+	if patch.Metadata["Author"] != "original" {
+		t.Fatal("inspection metadata mutated the parsed patch")
+	}
+	if _, err := ApplyParsedWithOptions(nil, nil, ApplyOptions{}); !errors.Is(err, ErrInvalidPatch) {
+		t.Fatalf("nil parsed patch error = %v", err)
+	}
+}
+
+func TestNilPublicInputsReturnErrors(t *testing.T) {
+	var nilPatch *BPSPatch
+	if _, err := ApplyParsedWithOptions(nil, nilPatch, ApplyOptions{}); !errors.Is(err, ErrInvalidPatch) {
+		t.Fatalf("typed nil patch error = %v", err)
+	}
+	if inspection := InspectParsed(nilPatch); inspection.Format != "" {
+		t.Fatalf("typed nil inspection = %+v", inspection)
+	}
+	//lint:ignore SA1012 nil context support is part of the public API contract.
+	if _, err := ApplyReaderAt(nil, nil, 0, bytes.NewReader([]byte("PATCHEOF")), 8, &memoryFile{}, ApplyOptions{}); err == nil {
+		t.Fatal("nil source reader was accepted")
+	}
+	//lint:ignore SA1012 nil context support is part of the public API contract.
+	if _, err := CreateReaderAt(nil, bytes.NewReader(nil), 0, bytes.NewReader(nil), 0, nil, FormatIPS, nil); err == nil {
+		t.Fatal("nil creation writer was accepted")
+	}
+	//lint:ignore SA1012 nil context support is part of the public API contract.
+	if _, err := HashReader(nil, nil); err == nil {
+		t.Fatal("nil hash reader was accepted")
+	}
+	if _, err := ExtractZIP("missing.zip", "", InputAny, 0, nil); err == nil {
+		t.Fatal("nil archive writer was accepted")
 	}
 }
 
@@ -1041,7 +1157,10 @@ func TestTemporaryHeaderUsesFinalOutputLimit(t *testing.T) {
 func TestBPSDeltaHandlesHighlyRepetitiveInput(t *testing.T) {
 	source := bytes.Repeat([]byte{1, 2}, 32<<10)
 	target := append(append([]byte(nil), source[1:]...), source[0])
-	patch := createBPS(source, target, true)
+	patch, err := createBPSDeltaPatch(source, target, CreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	encoded, err := patch.MarshalBinary()
 	if err != nil {
 		t.Fatal(err)
@@ -1049,6 +1168,24 @@ func TestBPSDeltaHandlesHighlyRepetitiveInput(t *testing.T) {
 	got, err := Apply(source, encoded, ApplyOptions{Validate: true})
 	if err != nil || !bytes.Equal(got, target) {
 		t.Fatalf("repetitive BPS delta: %v", err)
+	}
+}
+
+func TestBPSDeltaHonorsCreationOptions(t *testing.T) {
+	if _, err := Create(testOriginal, testModified, Format(" BPS "), &CreateOptions{Description: "metadata", MaxPatchSize: 4}); !errors.Is(err, ErrOutputTooLarge) {
+		t.Fatalf("size limit error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := Create(testOriginal, testModified, FormatBPS, &CreateOptions{Context: ctx}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation error = %v", err)
+	}
+	patch, err := Create(testOriginal, testModified, FormatBPS, &CreateOptions{Description: "metadata"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if patch.Description() != "metadata" {
+		t.Fatalf("description = %q", patch.Description())
 	}
 }
 

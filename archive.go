@@ -12,14 +12,19 @@ import (
 	"strings"
 )
 
+// InputKind controls which ZIP entries are considered candidates.
 type InputKind string
 
 const (
+	// InputSource selects likely source-ROM entries.
 	InputSource InputKind = "source"
-	InputPatch  InputKind = "patch"
-	InputAny    InputKind = "file"
+	// InputPatch selects recognized patch entries.
+	InputPatch InputKind = "patch"
+	// InputAny permits any regular ZIP entry.
+	InputAny InputKind = "file"
 )
 
+// ArchiveEntry describes a selectable file inside a ZIP archive.
 type ArchiveEntry struct {
 	Name            string `json:"name"`
 	Size            uint64 `json:"size"`
@@ -41,6 +46,7 @@ var sourceExtensions = map[string]bool{
 	".iso": true, ".img": true, ".cue": true, ".md": true, ".gen": true,
 }
 
+// ListZIP lists regular entries and their candidate classifications.
 func ListZIP(path string) ([]ArchiveEntry, error) {
 	r, err := zip.OpenReader(path)
 	if err != nil {
@@ -50,6 +56,7 @@ func ListZIP(path string) ([]ArchiveEntry, error) {
 	return describeZIP(r.File), nil
 }
 
+// ListZIPBytes lists entries in an in-memory ZIP archive.
 func ListZIPBytes(data []byte) ([]ArchiveEntry, error) {
 	r, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
@@ -74,6 +81,7 @@ func describeZIP(files []*zip.File) []ArchiveEntry {
 	return entries
 }
 
+// ReadZIP selects and reads one ZIP entry. A zero maxSize means unlimited.
 func ReadZIP(path, entry string, kind InputKind, maxSize uint64) ([]byte, string, error) {
 	r, err := zip.OpenReader(path)
 	if err != nil {
@@ -83,9 +91,12 @@ func ReadZIP(path, entry string, kind InputKind, maxSize uint64) ([]byte, string
 	return selectZIP(r.File, entry, kind, maxSize)
 }
 
-// ExtractZIP writes one explicitly selected or unambiguous entry without
-// buffering it in memory.
+// ExtractZIP selects one ZIP entry and streams it to dst without buffering the
+// entry in memory.
 func ExtractZIP(path, entry string, kind InputKind, maxSize uint64, dst io.Writer) (string, error) {
+	if isNilInterface(dst) {
+		return "", fmt.Errorf("destination writer must be non-nil")
+	}
 	r, err := zip.OpenReader(path)
 	if err != nil {
 		return "", err
@@ -117,6 +128,7 @@ func ExtractZIP(path, entry string, kind InputKind, maxSize uint64, dst io.Write
 	return f.Name, nil
 }
 
+// ReadZIPBytes selects and reads one entry from an in-memory ZIP archive.
 func ReadZIPBytes(data []byte, entry string, kind InputKind, maxSize uint64) ([]byte, string, error) {
 	r, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
@@ -129,6 +141,9 @@ func selectZIP(files []*zip.File, entry string, kind InputKind, maxSize uint64) 
 	f, err := findZIP(files, entry, kind, maxSize)
 	if err != nil {
 		return nil, "", err
+	}
+	if f.UncompressedSize64 > uint64(int(^uint(0)>>1)) {
+		return nil, "", fmt.Errorf("%w: archive entry is too large for memory: %d bytes", ErrOutputTooLarge, f.UncompressedSize64)
 	}
 	r, err := f.Open()
 	if err != nil {
@@ -153,6 +168,11 @@ func selectZIP(files []*zip.File, entry string, kind InputKind, maxSize uint64) 
 }
 
 func findZIP(files []*zip.File, entry string, kind InputKind, maxSize uint64) (*zip.File, error) {
+	switch kind {
+	case InputSource, InputPatch, InputAny:
+	default:
+		return nil, fmt.Errorf("%w: unknown archive input kind %q", ErrUnsupported, kind)
+	}
 	var candidates []*zip.File
 	for _, f := range files {
 		if f.FileInfo().IsDir() {

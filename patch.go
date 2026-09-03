@@ -1,33 +1,53 @@
 package rompatcher
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
 )
 
+// Format identifies a supported patch encoding.
 type Format string
 
+func normalizeFormat(format Format) Format {
+	return Format(strings.ToLower(strings.TrimSpace(string(format))))
+}
+
 const (
-	FormatIPS    Format = "ips"
-	FormatIPS32  Format = "ips32"
-	FormatEBP    Format = "ebp"
-	FormatUPS    Format = "ups"
+	// FormatIPS identifies classic IPS patches.
+	FormatIPS Format = "ips"
+	// FormatIPS32 identifies 32-bit IPS patches.
+	FormatIPS32 Format = "ips32"
+	// FormatEBP identifies EarthBound Patch format files.
+	FormatEBP Format = "ebp"
+	// FormatUPS identifies UPS patches.
+	FormatUPS Format = "ups"
+	// FormatAPSN64 identifies APS patches for Nintendo 64 images.
 	FormatAPSN64 Format = "aps"
+	// FormatAPSGBA identifies APS patches for Game Boy Advance images.
 	FormatAPSGBA Format = "aps-gba"
-	FormatBPS    Format = "bps"
-	FormatRUP    Format = "rup"
-	FormatPPF    Format = "ppf"
-	FormatBDF    Format = "bdf"
-	FormatPMSR   Format = "mod"
+	// FormatBPS identifies BPS patches.
+	FormatBPS Format = "bps"
+	// FormatRUP identifies NINJA2 RUP patches.
+	FormatRUP Format = "rup"
+	// FormatPPF identifies PPF patches.
+	FormatPPF Format = "ppf"
+	// FormatBDF identifies BSDIFF40 patches.
+	FormatBDF Format = "bdf"
+	// FormatPMSR identifies Star Rod PMSR mod patches.
+	FormatPMSR Format = "mod"
+	// FormatVCDIFF identifies VCDIFF/xdelta patches.
 	FormatVCDIFF Format = "vcdiff"
 )
 
+// ValidationInfo describes checksums accepted as source validation.
 type ValidationInfo struct {
 	Type   string   `json:"type"`
 	Values []string `json:"values"`
 }
 
+// Patch is a parsed patch that can be inspected, applied, or serialized.
 type Patch interface {
 	Format() Format
 	Apply(source []byte, options ApplyOptions) ([]byte, error)
@@ -37,19 +57,29 @@ type Patch interface {
 	MarshalBinary() ([]byte, error)
 }
 
+// ApplyOptions controls validation, ROM transforms, limits, and progress.
 type ApplyOptions struct {
-	Validate, RemoveHeader, AddHeader, FixChecksum bool
-	SourceName                                     string
+	// Validate enables source and generated-output checks supported by the format.
+	Validate bool
+	// RemoveHeader temporarily removes a recognized copier or container header.
+	RemoveHeader bool
+	// AddHeader temporarily adds a recognized copier or container header.
+	AddHeader bool
+	// FixChecksum repairs a recognized internal ROM checksum after patching.
+	FixChecksum bool
+	// SourceName supplies the filename extension used for ROM-specific handling.
+	SourceName string
 	// Context cancels long-running patch operations. Nil means context.Background.
 	Context context.Context
-	// Progress receives coarse, monotonic progress updates. Callbacks must return
-	// quickly; they run synchronously with patching.
+	// Progress receives coarse progress updates. Callbacks must return quickly;
+	// they run synchronously with patching.
 	Progress func(Progress)
 	// MaxOutputSize caps allocations from untrusted patches. Zero chooses a
 	// source-relative default (64 MiB plus twice the source size).
 	MaxOutputSize uint64
 }
 
+// Progress describes a synchronous operation progress update.
 type Progress struct {
 	Phase     string `json:"phase"`
 	Format    Format `json:"format,omitempty"`
@@ -83,14 +113,39 @@ func reportProgress(opts ApplyOptions, p Progress) error {
 	return checkCanceled(opts)
 }
 
-type CreateOptions struct {
-	Metadata    map[string]string
-	Description string
-	SourceName  string
-	// BPSDelta forces delta matching. By default it is used for files up to 4 MiB.
-	BPSDelta bool
+func withoutProgressPhase(opts ApplyOptions, phase string) ApplyOptions {
+	callback := opts.Progress
+	if callback != nil {
+		opts.Progress = func(progress Progress) {
+			if progress.Phase != phase {
+				callback(progress)
+			}
+		}
+	}
+	return opts
 }
 
+// CreateOptions controls patch metadata, limits, and progress during creation.
+type CreateOptions struct {
+	// Metadata supplies EBP metadata fields.
+	Metadata map[string]string
+	// Description supplies the description or metadata field where supported.
+	Description string
+	// SourceName supplies the filename extension used for format metadata.
+	SourceName string
+	// BPSDelta forces the memory-intensive delta matcher. Create uses it by
+	// default for inputs up to 4 MiB; CreateReaderAt uses it only when requested.
+	BPSDelta bool
+	// Context cancels creation. Nil means context.Background.
+	Context context.Context
+	// Progress receives coarse creation updates.
+	Progress func(Progress)
+	// MaxPatchSize limits patch output. Zero chooses a default of
+	// 64 MiB plus twice the larger input size.
+	MaxPatchSize uint64
+}
+
+// Parse detects and decodes a patch held in memory.
 func Parse(data []byte) (Patch, error) {
 	switch {
 	case len(data) >= 5 && string(data[:5]) == "PATCH":
@@ -120,59 +175,51 @@ func Parse(data []byte) (Patch, error) {
 	}
 }
 
+// Create builds an in-memory patch from original and modified data.
 func Create(original, modified []byte, format Format, opts *CreateOptions) (Patch, error) {
-	switch Format(strings.ToLower(strings.TrimSpace(string(format)))) {
-	case FormatIPS:
-		return createIPS(original, modified, nil)
-	case FormatIPS32:
-		return createIPS32(original, modified)
-	case FormatEBP:
-		metadata := map[string]string{}
+	format = normalizeFormat(format)
+	if format == FormatBPS {
+		local := CreateOptions{}
 		if opts != nil {
-			for k, v := range opts.Metadata {
-				metadata[k] = v
-			}
+			local = *opts
 		}
-		return createIPS(original, modified, metadata)
-	case FormatUPS:
-		return createUPS(original, modified), nil
-	case FormatAPSN64:
-		if uint64(len(modified)) > uint64(^uint32(0)) {
-			return nil, fmt.Errorf("%w: APS output exceeds 32-bit size", ErrUnsupported)
-		}
-		name := ""
-		if opts != nil {
-			name = opts.SourceName
-		}
-		return createAPSN64(original, modified, name), nil
-	case FormatBPS:
-		delta := len(original) <= 4<<20
-		if opts != nil && opts.BPSDelta {
+		delta := len(original) <= 4<<20 && len(modified) <= 4<<20
+		if local.BPSDelta {
 			delta = true
 		}
-		return createBPS(original, modified, delta), nil
-	case FormatRUP:
-		desc := ""
-		if opts != nil {
-			desc = opts.Description
+		if delta {
+			p, err := createBPSDeltaPatch(original, modified, local)
+			if err != nil {
+				return nil, err
+			}
+			encoded, err := p.MarshalBinary()
+			if err != nil {
+				return nil, err
+			}
+			limit := patchSizeLimit(int64(len(original)), int64(len(modified)), local)
+			if uint64(len(encoded)) > limit {
+				return nil, fmt.Errorf("%w: patch exceeds %d bytes", ErrOutputTooLarge, limit)
+			}
+			if err := reportCreatePhase(local, "complete", format, int64(len(encoded)), int64(len(encoded))); err != nil {
+				return nil, err
+			}
+			return parseBPS(encoded)
 		}
-		return createRUP(original, modified, desc), nil
-	case FormatPPF:
-		if len(modified) < len(original) {
-			return nil, fmt.Errorf("%w: PPF cannot represent a smaller output", ErrUnsupported)
-		}
-		return createPPF(original, modified), nil
-	default:
-		return nil, fmt.Errorf("%w: cannot create %q patches", ErrUnsupported, format)
 	}
-}
-
-func Apply(source, patchData []byte, options ApplyOptions) ([]byte, error) {
-	p, err := Parse(patchData)
-	if err != nil {
+	var encoded bytes.Buffer
+	ctx := context.Background()
+	if opts != nil && opts.Context != nil {
+		ctx = opts.Context
+	}
+	if _, err := CreateReaderAt(ctx, bytes.NewReader(original), int64(len(original)), bytes.NewReader(modified), int64(len(modified)), &encoded, format, opts); err != nil {
 		return nil, err
 	}
-	return ApplyParsedWithOptions(source, p, options)
+	return Parse(encoded.Bytes())
+}
+
+// Apply parses patchData and applies it to source in memory.
+func Apply(source, patchData []byte, options ApplyOptions) ([]byte, error) {
+	return applyEncodedWithOptions(source, patchData, options)
 }
 
 func checkOutputSize(size uint64, sourceSize int, options ApplyOptions) error {
@@ -202,6 +249,11 @@ func outputSizeLimit(sourceSize uint64, options ApplyOptions) uint64 {
 
 type basePatch struct{}
 
-func (basePatch) ValidateSource([]byte) bool      { return true }
+// ValidateSource accepts any source when a format has no source signature.
+func (basePatch) ValidateSource([]byte) bool { return true }
+
+// ValidationInfo returns nil when a format has no source signature.
 func (basePatch) ValidationInfo() *ValidationInfo { return nil }
-func (basePatch) Description() string             { return "" }
+
+// Description returns an empty string when a format has no description field.
+func (basePatch) Description() string { return "" }

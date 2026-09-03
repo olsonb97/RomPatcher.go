@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -81,6 +83,40 @@ func TestPatchEntriesFollowArchivePatches(t *testing.T) {
 	}
 	if _, err := assignPatchEntries([]string{"base.bps"}, []string{"unused"}); err == nil {
 		t.Fatal("entry for a raw patch was accepted")
+	}
+}
+
+func TestConflictingAndFormatSpecificFlagsFailEarly(t *testing.T) {
+	ctx := context.Background()
+	if err := apply(ctx, []string{"missing.rom", "missing.ips", "--add-header", "--remove-header"}); err == nil {
+		t.Fatal("conflicting header flags were accepted")
+	}
+	if err := create(ctx, []string{"missing.rom", "missing-modified.rom", "--format", "ips", "--title", "unused"}); err == nil {
+		t.Fatal("EBP-only metadata flag was accepted for IPS")
+	}
+}
+
+func TestFlagDiagnosticsStayMachineReadable(t *testing.T) {
+	f := flag.NewFlagSet("test", flag.ContinueOnError)
+	var output bytes.Buffer
+	f.SetOutput(&output)
+	f.Usage = func() { fmt.Fprintln(f.Output(), "usage: test") }
+	if err := parseInterspersed(f, []string{"--unknown", "-j"}); err == nil {
+		t.Fatal("unknown flag was accepted")
+	}
+	if output.Len() != 0 {
+		t.Fatalf("parse diagnostics leaked before JSON error: %q", output.String())
+	}
+
+	help := flag.NewFlagSet("test", flag.ContinueOnError)
+	output.Reset()
+	help.SetOutput(&output)
+	help.Usage = func() { fmt.Fprintln(help.Output(), "usage: test") }
+	if err := parseInterspersed(help, []string{"--help"}); !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("help error = %v", err)
+	}
+	if output.String() != "usage: test\n" {
+		t.Fatalf("help output = %q", output.String())
 	}
 }
 
