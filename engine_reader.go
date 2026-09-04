@@ -36,7 +36,7 @@ func (d *readerDecoder) seek(offset int64) error {
 
 func (d *readerDecoder) skip(length int64) error {
 	if length < 0 || length > d.remaining() {
-		return ErrUnexpectedEnd
+		return fmt.Errorf("%w at patch offset %d: cannot skip %d bytes with %d remaining", ErrUnexpectedEnd, d.off, length, d.remaining())
 	}
 	d.off += length
 	return d.ctx.Err()
@@ -44,7 +44,7 @@ func (d *readerDecoder) skip(length int64) error {
 
 func (d *readerDecoder) read(dst []byte) error {
 	if int64(len(dst)) > d.remaining() {
-		return ErrUnexpectedEnd
+		return fmt.Errorf("%w at patch offset %d: need %d bytes, have %d", ErrUnexpectedEnd, d.off, len(dst), d.remaining())
 	}
 	if err := d.ctx.Err(); err != nil {
 		return err
@@ -79,7 +79,7 @@ func (d *readerDecoder) read(dst []byte) error {
 
 func (d *readerDecoder) bytes(length int64) ([]byte, error) {
 	if length < 0 || uint64(length) > uint64(int(^uint(0)>>1)) {
-		return nil, ErrInvalidPatch
+		return nil, fmt.Errorf("%w: byte field length %d cannot be represented", ErrInvalidPatch, length)
 	}
 	out := make([]byte, int(length))
 	if err := d.read(out); err != nil {

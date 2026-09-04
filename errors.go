@@ -8,13 +8,13 @@ var (
 	// ErrInvalidPatch means the patch structure or values are malformed.
 	ErrInvalidPatch = errors.New("rompatcher: invalid patch")
 	// ErrSourceMismatch means source validation failed.
-	ErrSourceMismatch = errors.New("rompatcher: source checksum mismatch")
+	ErrSourceMismatch = errors.New("rompatcher: source does not match patch")
 	// ErrTargetMismatch means generated output validation failed.
-	ErrTargetMismatch = errors.New("rompatcher: target checksum mismatch")
+	ErrTargetMismatch = errors.New("rompatcher: patched output does not match patch")
 	// ErrPatchMismatch means the patch's own checksum failed.
 	ErrPatchMismatch = errors.New("rompatcher: patch checksum mismatch")
 	// ErrOutputTooLarge means a configured or default size limit was exceeded.
-	ErrOutputTooLarge = errors.New("rompatcher: requested output exceeds the configured size limit")
+	ErrOutputTooLarge = errors.New("rompatcher: size limit exceeded")
 	// ErrUnsupported means the requested operation is unavailable for the format.
 	ErrUnsupported = errors.New("rompatcher: operation is not supported by this format")
 	// ErrUnexpectedEnd means the patch ended before a complete value was read.

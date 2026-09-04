@@ -124,8 +124,8 @@ func parseUPS(data []byte) (*UPSPatch, error) {
 	if err != nil {
 		return nil, err
 	}
-	if want != CRC32(data[:len(data)-4]) {
-		return nil, ErrPatchMismatch
+	if got := CRC32(data[:len(data)-4]); want != got {
+		return nil, checksum32Mismatch(ErrPatchMismatch, FormatUPS, "CRC32", want, got)
 	}
 	if err := p.validateRecords(); err != nil {
 		return nil, err

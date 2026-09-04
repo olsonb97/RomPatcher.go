@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -1151,6 +1152,59 @@ func TestTemporaryHeaderUsesFinalOutputLimit(t *testing.T) {
 	}
 	if _, err := ApplyParsedWithOptions(source, patch, ApplyOptions{AddHeader: true, RemoveHeader: true}); err == nil {
 		t.Fatal("conflicting header options were accepted")
+	}
+}
+
+func TestSourceMismatchSuggestsTemporaryHeader(t *testing.T) {
+	source := make([]byte, 0x40000)
+	headered := append(bytes.Repeat([]byte{0x5a}, 512), source...)
+	for _, format := range []Format{FormatUPS, FormatRUP} {
+		patch, err := Create(headered, append([]byte(nil), headered...), format, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded, err := patch.MarshalBinary()
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Apply(source, encoded, ApplyOptions{Validate: true, SourceName: "game.sfc"})
+		if !errors.Is(err, ErrSourceMismatch) || !strings.Contains(err.Error(), "try --add-header") || !strings.Contains(err.Error(), "262656") {
+			t.Fatalf("%s header mismatch error = %v", format, err)
+		}
+		_, err = Apply(source, encoded, ApplyOptions{Validate: true, AddHeader: true, SourceName: "game.sfc"})
+		if !errors.Is(err, ErrSourceMismatch) || !strings.Contains(err.Error(), "prevents strict whole-file checksum validation") || !strings.Contains(err.Error(), "without validation") {
+			t.Fatalf("%s synthetic header validation error = %v", format, err)
+		}
+	}
+}
+
+func TestValidationErrorsIncludeActionableDetails(t *testing.T) {
+	patch, err := Create(testOriginal, testModified, FormatBPS, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := patch.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongSource := append([]byte(nil), testOriginal...)
+	wrongSource[0] ^= 0xff
+	_, err = Apply(wrongSource, encoded, ApplyOptions{Validate: true})
+	if !errors.Is(err, ErrSourceMismatch) || !strings.Contains(err.Error(), "BPS CRC32 expected") || !strings.Contains(err.Error(), "got") {
+		t.Fatalf("source validation error = %v", err)
+	}
+
+	corrupt := append([]byte(nil), encoded...)
+	corrupt[len(corrupt)-1] ^= 0xff
+	_, err = Parse(corrupt)
+	if !errors.Is(err, ErrPatchMismatch) || !strings.Contains(err.Error(), "BPS CRC32 expected") {
+		t.Fatalf("patch validation error = %v", err)
+	}
+
+	d := newDecoder([]byte{1})
+	_, err = d.bytes(2)
+	if !errors.Is(err, ErrUnexpectedEnd) || !strings.Contains(err.Error(), "patch offset 0") || !strings.Contains(err.Error(), "need 2 bytes, have 1") {
+		t.Fatalf("truncated field error = %v", err)
 	}
 }
 

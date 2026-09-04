@@ -2,6 +2,7 @@ package rompatcher
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 )
@@ -92,6 +93,9 @@ func applyWithROMTransforms(source []byte, opts ApplyOptions, apply func([]byte,
 	}
 	out, err := apply(working, applyOptions)
 	if err != nil {
+		if fake > 0 && opts.Validate && errors.Is(err, ErrSourceMismatch) {
+			return nil, fmt.Errorf("%w: the temporary %d-byte header prevents strict whole-file checksum validation; use the original headered source, or retry without validation only after independently verifying the headerless source", ErrSourceMismatch, fake)
+		}
 		return nil, err
 	}
 	if header != nil {

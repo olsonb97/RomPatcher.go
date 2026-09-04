@@ -432,6 +432,9 @@ func TestApplyFileChainCancellationDoesNotPublish(t *testing.T) {
 	if _, err := os.Stat(outputPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("canceled output exists: %v", err)
 	}
+	if matches, _ := filepath.Glob(filepath.Join(dir, ".rompatcher-chain-*")); len(matches) != 0 {
+		t.Fatalf("canceled intermediate files remain: %v", matches)
+	}
 }
 
 func FuzzApplyReaderAtNoPanic(f *testing.F) {
@@ -449,5 +452,33 @@ func FuzzApplyReaderAtNoPanic(f *testing.F) {
 	f.Fuzz(func(t *testing.T, source, patch []byte) {
 		output := make(benchmarkReadWriterAt, 1<<20)
 		_, _ = ApplyReaderAt(context.Background(), bytes.NewReader(source), int64(len(source)), bytes.NewReader(patch), int64(len(patch)), output, ApplyOptions{MaxOutputSize: 1 << 20})
+	})
+}
+
+func FuzzCreateReaderAtRoundTrip(f *testing.F) {
+	f.Add([]byte("original"), []byte("modified"), uint8(0))
+	f.Add([]byte{}, []byte{}, uint8(4))
+	formats := []Format{FormatIPS, FormatIPS32, FormatEBP, FormatUPS, FormatBPS, FormatAPSN64, FormatRUP, FormatPPF}
+	f.Fuzz(func(t *testing.T, original, modified []byte, formatIndex uint8) {
+		if len(original) > 1024 || len(modified) > 1024 {
+			t.Skip()
+		}
+		format := formats[int(formatIndex)%len(formats)]
+		var encoded bytes.Buffer
+		_, err := CreateReaderAt(context.Background(), bytes.NewReader(original), int64(len(original)), bytes.NewReader(modified), int64(len(modified)), &encoded, format, &CreateOptions{MaxPatchSize: 1 << 20})
+		if err != nil {
+			if errors.Is(err, ErrUnsupported) && len(modified) < len(original) && (format == FormatEBP || format == FormatPPF) {
+				return
+			}
+			t.Fatal(err)
+		}
+		output := new(memoryFile)
+		size, err := ApplyReaderAt(context.Background(), bytes.NewReader(original), int64(len(original)), bytes.NewReader(encoded.Bytes()), int64(encoded.Len()), output, ApplyOptions{Validate: true, MaxOutputSize: 1 << 20})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if size != int64(len(modified)) || !bytes.Equal(output.data[:size], modified) {
+			t.Fatalf("%s round trip produced %d bytes, expected %d", format, size, len(modified))
+		}
 	})
 }

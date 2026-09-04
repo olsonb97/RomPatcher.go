@@ -231,11 +231,11 @@ func ApplyFileContext(ctx context.Context, sourcePath, patchPath, outputPath str
 	defer patch.Close()
 	sourceInfo, err := source.Stat()
 	if err != nil {
-		return err
+		return fmt.Errorf("stat source: %w", err)
 	}
 	patchInfo, err := patch.Stat()
 	if err != nil {
-		return err
+		return fmt.Errorf("stat patch: %w", err)
 	}
 	if opts.SourceName == "" {
 		opts.SourceName = sourcePath
@@ -280,11 +280,11 @@ func CreateFileContext(ctx context.Context, originalPath, modifiedPath, outputPa
 	defer modified.Close()
 	originalInfo, err := original.Stat()
 	if err != nil {
-		return err
+		return fmt.Errorf("stat original: %w", err)
 	}
 	modifiedInfo, err := modified.Stat()
 	if err != nil {
-		return err
+		return fmt.Errorf("stat modified: %w", err)
 	}
 	local := CreateOptions{}
 	if opts != nil {

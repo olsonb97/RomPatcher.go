@@ -24,7 +24,7 @@ func (d *decoder) seek(off int) error {
 
 func (d *decoder) skip(n int) error {
 	if n < 0 || n > d.remaining() {
-		return ErrUnexpectedEnd
+		return fmt.Errorf("%w at patch offset %d: cannot skip %d bytes with %d remaining", ErrUnexpectedEnd, d.off, n, d.remaining())
 	}
 	d.off += n
 	return nil
@@ -41,7 +41,7 @@ func addInt64(a, b int64) (int64, bool) {
 
 func (d *decoder) u8() (byte, error) {
 	if d.remaining() < 1 {
-		return 0, ErrUnexpectedEnd
+		return 0, fmt.Errorf("%w at patch offset %d: need 1 byte, have %d", ErrUnexpectedEnd, d.off, d.remaining())
 	}
 	v := d.b[d.off]
 	d.off++
@@ -50,7 +50,7 @@ func (d *decoder) u8() (byte, error) {
 
 func (d *decoder) bytes(n int) ([]byte, error) {
 	if n < 0 || d.remaining() < n {
-		return nil, ErrUnexpectedEnd
+		return nil, fmt.Errorf("%w at patch offset %d: need %d bytes, have %d", ErrUnexpectedEnd, d.off, n, d.remaining())
 	}
 	v := d.b[d.off : d.off+n]
 	d.off += n

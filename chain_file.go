@@ -43,7 +43,7 @@ func ApplyFileChainContext(ctx context.Context, sourcePath string, patchPaths []
 	}()
 	currentInfo, err := current.Stat()
 	if err != nil {
-		return result, err
+		return result, fmt.Errorf("stat source: %w", err)
 	}
 	if err := ensureOutputAbsent(outputPath); err != nil {
 		return result, err
@@ -55,103 +55,113 @@ func ApplyFileChainContext(ctx context.Context, sourcePath string, patchPaths []
 		if err := reportProgress(opts, Progress{Phase: "chain", Completed: int64(index), Total: int64(len(patchPaths))}); err != nil {
 			return result, err
 		}
-		patch, openErr := os.Open(patchPath)
-		if openErr != nil {
-			return result, fmt.Errorf("patch %d: open: %w", index+1, openErr)
+		stepOptions := opts
+		if index+1 < len(patchPaths) {
+			stepOptions.FixChecksum = false
 		}
-		patchInfo, statErr := patch.Stat()
-		if statErr != nil {
-			_ = patch.Close()
-			return result, fmt.Errorf("patch %d: stat: %w", index+1, statErr)
+		step, stepErr := applyFileChainStep(ctx, current, currentSize, patchPath, destinationDir, stepOptions, index+1)
+		if stepErr != nil {
+			return result, stepErr
 		}
-		format, formatErr := formatReaderAt(ctx, patch, patchInfo.Size())
-		if formatErr != nil {
-			_ = patch.Close()
-			return result, fmt.Errorf("patch %d: %w", index+1, formatErr)
+		result.Steps = append(result.Steps, step.result(index+1))
+
+		if index+1 == len(patchPaths) {
+			defer os.Remove(step.path)
+			if err := reportProgress(opts, Progress{Phase: "chain", Completed: int64(len(patchPaths)), Total: int64(len(patchPaths))}); err != nil {
+				return result, err
+			}
+			if err := publishTemp(step.path, outputPath); err != nil {
+				return result, err
+			}
+			return result, nil
 		}
-		tmp, createErr := os.CreateTemp(destinationDir, ".rompatcher-chain-*")
-		if createErr != nil {
-			_ = patch.Close()
-			return result, fmt.Errorf("patch %d: create temporary output: %w", index+1, createErr)
+
+		if err := current.Close(); err != nil {
+			_ = os.Remove(step.path)
+			return result, fmt.Errorf("close chain input: %w", err)
 		}
-		tmpPath := tmp.Name()
-		keepTemp := false
-		func() {
-			defer func() {
-				_ = tmp.Close()
-				_ = patch.Close()
-				if !keepTemp {
-					_ = os.Remove(tmpPath)
-				}
-			}()
-			stepOptions := opts
-			stepOptions.Context = ctx
-			if index+1 < len(patchPaths) {
-				stepOptions.FixChecksum = false
-			}
-			var size int64
-			size, err = ApplyReaderAt(ctx, current, currentSize, patch, patchInfo.Size(), tmp, stepOptions)
-			if err != nil {
-				err = fmt.Errorf("patch %d (%s): %w", index+1, format, err)
-				return
-			}
-			if err = tmp.Truncate(size); err != nil {
-				err = fmt.Errorf("patch %d: truncate output: %w", index+1, err)
-				return
-			}
-			if err = tmp.Sync(); err != nil {
-				err = fmt.Errorf("patch %d: sync output: %w", index+1, err)
-				return
-			}
-			if err = tmp.Close(); err != nil {
-				err = fmt.Errorf("patch %d: close output: %w", index+1, err)
-				return
-			}
-			var verify *os.File
-			verify, err = os.Open(tmpPath)
-			if err != nil {
-				return
-			}
-			var hashes HashInfo
-			hashes, err = HashReader(ctx, verify)
-			_ = verify.Close()
-			if err != nil {
-				return
-			}
-			result.Steps = append(result.Steps, ChainStep{
-				Index:      index + 1,
-				Inspection: Inspection{Format: format},
-				Output: ArtifactInfo{Size: sizePtr(uint64(size)), Hashes: map[string]string{
-					"crc32": hashes.CRC32,
-					"sha1":  hashes.SHA1,
-				}},
-			})
-			if index+1 == len(patchPaths) {
-				if err = reportProgress(opts, Progress{Phase: "chain", Completed: int64(len(patchPaths)), Total: int64(len(patchPaths))}); err != nil {
-					return
-				}
-				if err = publishTemp(tmpPath, outputPath); err != nil {
-					return
-				}
-				return
-			}
-			if closeErr := current.Close(); closeErr != nil {
-				err = closeErr
-				return
-			}
-			if currentOwned {
-				_ = os.Remove(currentPath)
-			}
-			current, err = os.Open(tmpPath)
-			if err != nil {
-				return
-			}
-			currentPath, currentOwned, currentSize = tmpPath, true, size
-			keepTemp = true
-		}()
+		if currentOwned {
+			_ = os.Remove(currentPath)
+		}
+		current, err = os.Open(step.path)
 		if err != nil {
-			return result, err
+			_ = os.Remove(step.path)
+			return result, fmt.Errorf("open intermediate output: %w", err)
 		}
+		currentPath, currentOwned, currentSize = step.path, true, step.size
 	}
 	return result, nil
+}
+
+type appliedChainFile struct {
+	path   string
+	size   int64
+	format Format
+	hashes HashInfo
+}
+
+func (step appliedChainFile) result(index int) ChainStep {
+	return ChainStep{
+		Index:      index,
+		Inspection: Inspection{Format: step.format},
+		Output: ArtifactInfo{Size: sizePtr(uint64(step.size)), Hashes: map[string]string{
+			"crc32": step.hashes.CRC32,
+			"sha1":  step.hashes.SHA1,
+		}},
+	}
+}
+
+func applyFileChainStep(ctx context.Context, source *os.File, sourceSize int64, patchPath, destinationDir string, opts ApplyOptions, index int) (step appliedChainFile, err error) {
+	patch, err := os.Open(patchPath)
+	if err != nil {
+		return step, fmt.Errorf("patch %d: open: %w", index, err)
+	}
+	defer patch.Close()
+	patchInfo, err := patch.Stat()
+	if err != nil {
+		return step, fmt.Errorf("patch %d: stat: %w", index, err)
+	}
+	step.format, err = formatReaderAt(ctx, patch, patchInfo.Size())
+	if err != nil {
+		return step, fmt.Errorf("patch %d: %w", index, err)
+	}
+
+	temporary, err := os.CreateTemp(destinationDir, ".rompatcher-chain-*")
+	if err != nil {
+		return step, fmt.Errorf("patch %d: create temporary output: %w", index, err)
+	}
+	step.path = temporary.Name()
+	keepTemporary := false
+	defer func() {
+		_ = temporary.Close()
+		if !keepTemporary {
+			_ = os.Remove(step.path)
+		}
+	}()
+
+	step.size, err = ApplyReaderAt(ctx, source, sourceSize, patch, patchInfo.Size(), temporary, opts)
+	if err != nil {
+		return step, fmt.Errorf("patch %d (%s): %w", index, step.format, err)
+	}
+	if err := temporary.Truncate(step.size); err != nil {
+		return step, fmt.Errorf("patch %d: truncate output: %w", index, err)
+	}
+	if err := temporary.Sync(); err != nil {
+		return step, fmt.Errorf("patch %d: sync output: %w", index, err)
+	}
+	if err := temporary.Close(); err != nil {
+		return step, fmt.Errorf("patch %d: close output: %w", index, err)
+	}
+
+	verify, err := os.Open(step.path)
+	if err != nil {
+		return step, fmt.Errorf("patch %d: open output for verification: %w", index, err)
+	}
+	step.hashes, err = HashReader(ctx, verify)
+	_ = verify.Close()
+	if err != nil {
+		return step, fmt.Errorf("patch %d: hash output: %w", index, err)
+	}
+	keepTemporary = true
+	return step, nil
 }

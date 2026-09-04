@@ -25,13 +25,17 @@ func extension(name string) string {
 
 // CanAddHeader reports whether a temporary header can be added for name.
 func CanAddHeader(data []byte, name string) *HeaderInfo {
-	if len(data) > 0x600000 {
+	return canAddHeaderSize(int64(len(data)), name)
+}
+
+func canAddHeaderSize(size int64, name string) *HeaderInfo {
+	if size < 0 || size > 0x600000 {
 		return nil
 	}
 	ext := extension(name)
 	for _, h := range knownHeaders {
 		for _, x := range h.extensions {
-			if ext == x && len(data)%h.multiple == 0 {
+			if ext == x && size%int64(h.multiple) == 0 {
 				return &HeaderInfo{Name: h.name, Size: h.size}
 			}
 		}

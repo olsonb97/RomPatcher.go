@@ -228,8 +228,8 @@ func parseBPS(data []byte) (*BPSPatch, error) {
 	if e != nil {
 		return nil, e
 	}
-	if CRC32(data[:len(data)-4]) != p.PatchCRC {
-		return nil, ErrPatchMismatch
+	if got := CRC32(data[:len(data)-4]); got != p.PatchCRC {
+		return nil, checksum32Mismatch(ErrPatchMismatch, FormatBPS, "CRC32", p.PatchCRC, got)
 	}
 	if err := p.validateActions(); err != nil {
 		return nil, err

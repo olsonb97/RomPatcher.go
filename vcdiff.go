@@ -544,7 +544,7 @@ func (p *VCDIFFPatch) decodeTargetWindow(w vcdWindow, dataSection, instSection, 
 			return nil, err
 		}
 		if sum != *w.adler {
-			return nil, ErrTargetMismatch
+			return nil, checksum32Mismatch(ErrTargetMismatch, FormatVCDIFF, "Adler-32", *w.adler, sum)
 		}
 	}
 	return window, nil
