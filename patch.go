@@ -54,13 +54,16 @@ const (
 	ApplyDirectionReverse ApplyDirection = "reverse"
 )
 
-func normalizeApplyDirection(direction ApplyDirection) (ApplyDirection, error) {
-	direction = ApplyDirection(strings.ToLower(strings.TrimSpace(string(direction))))
+// ParseApplyDirection parses auto, forward, or reverse application direction.
+func ParseApplyDirection(value string) (ApplyDirection, error) {
+	direction := ApplyDirection(strings.ToLower(strings.TrimSpace(value)))
 	switch direction {
+	case "auto":
+		return ApplyDirectionAuto, nil
 	case ApplyDirectionAuto, ApplyDirectionForward, ApplyDirectionReverse:
 		return direction, nil
 	default:
-		return "", fmt.Errorf("invalid apply direction %q", direction)
+		return "", fmt.Errorf("invalid apply direction %q: use auto, forward, or reverse", value)
 	}
 }
 

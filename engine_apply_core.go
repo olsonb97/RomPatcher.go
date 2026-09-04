@@ -63,12 +63,12 @@ func applyPatchReaderAt(ctx context.Context, source io.ReaderAt, sourceSize int6
 	if err != nil {
 		return 0, err
 	}
-	direction, err := normalizeApplyDirection(opts.Direction)
+	direction, err := ParseApplyDirection(string(opts.Direction))
 	if err != nil {
 		return 0, err
 	}
-	if direction == ApplyDirectionReverse && format != FormatUPS && format != FormatRUP {
-		return 0, fmt.Errorf("%w: %s patches are not reversible", ErrUnsupported, strings.ToUpper(string(format)))
+	if direction != ApplyDirectionAuto && format != FormatUPS && format != FormatRUP {
+		return 0, fmt.Errorf("%w: %s patches do not support explicit direction", ErrUnsupported, strings.ToUpper(string(format)))
 	}
 	opts.Direction = direction
 	readOutput, outputReadable := output.(io.ReaderAt)

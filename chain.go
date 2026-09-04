@@ -21,6 +21,11 @@ func ApplyChain(source []byte, patches [][]byte, opts ApplyOptions) (ChainResult
 	if len(patches) == 0 {
 		return ChainResult{}, fmt.Errorf("patch chain is empty")
 	}
+	var err error
+	opts, err = normalizeChainOptions(len(patches), opts)
+	if err != nil {
+		return ChainResult{}, err
+	}
 	current := source
 	result := ChainResult{Steps: make([]ChainStep, 0, len(patches))}
 	for index, data := range patches {
@@ -52,4 +57,16 @@ func ApplyChain(source []byte, patches [][]byte, opts ApplyOptions) (ChainResult
 		return result, err
 	}
 	return result, nil
+}
+
+func normalizeChainOptions(patchCount int, opts ApplyOptions) (ApplyOptions, error) {
+	direction, err := ParseApplyDirection(string(opts.Direction))
+	if err != nil {
+		return opts, err
+	}
+	if direction != ApplyDirectionAuto && patchCount != 1 {
+		return opts, fmt.Errorf("explicit apply direction requires exactly one patch")
+	}
+	opts.Direction = direction
+	return opts, nil
 }

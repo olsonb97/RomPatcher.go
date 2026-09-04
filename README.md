@@ -86,6 +86,7 @@ and checksum compatibility transformations use the memory-backed path.
 
 ```console
 rompatcher apply game.sfc translation.bps -v -o game-patched.sfc
+rompatcher apply patched.gba translation.ups -d reverse -o original.gba
 rompatcher apply --dry-run --json game.sfc translation.bps
 rompatcher apply games.zip patch.bps -s "region/game.sfc" -o game.sfc
 rompatcher apply game.sfc base.bps addon.ips -v -o final.sfc
@@ -101,7 +102,8 @@ rompatcher version
 
 `rompatcher apply SOURCE PATCH [PATCH...]` applies patches from left to right.
 Useful options are `-o` for output, `-v` to validate, `-n` for a dry run, `-j`
-for JSON, and `-p` for progress. Run `rompatcher apply --help` for the rest.
+for JSON, and `-d` for UPS/RUP direction. Run `rompatcher apply --help` for the
+rest. Explicit direction accepts `forward` or `reverse` and requires one patch.
 
 ZIP files are supported, but 7z files are not. If a ZIP contains multiple
 choices, run `rompatcher archive FILE.zip`, then select one with `-s` for the
@@ -129,8 +131,9 @@ Existing output files are never overwritten.
 
 Each job requires `source`, `patches`, and `output`; `output` is optional with
 `batch -n`. Optional fields are `sourceEntry`, `validate`, `removeHeader`,
-`addHeader`, `fixChecksum`, and `maxOutput`. Each patch requires `path` and may
-include `entry` for ZIP selection.
+`addHeader`, `fixChecksum`, `direction`, and `maxOutput`. Direction accepts
+`auto`, `forward`, or `reverse` and requires one patch. Each patch requires
+`path` and may include `entry` for ZIP selection.
 
 ## Building release archives
 

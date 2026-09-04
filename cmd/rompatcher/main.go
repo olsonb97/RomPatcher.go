@@ -88,7 +88,8 @@ func requestedJSON(args []string) bool {
 
 type applyFlags struct {
 	validate, remove, add, fix, dryRun, jsonOutput, progress bool
-	output, sourceEntry                                      string
+	output, sourceEntry, directionName                       string
+	direction                                                rompatcher.ApplyDirection
 	maxOutput                                                uint64
 	patchEntries                                             stringList
 }
@@ -106,6 +107,8 @@ func addApplyFlags(f *flag.FlagSet) *applyFlags {
 	f.BoolVar(&o.jsonOutput, "j", false, "alias for --json")
 	f.BoolVar(&o.progress, "progress", false, "write progress updates to stderr")
 	f.BoolVar(&o.progress, "p", false, "alias for --progress")
+	f.StringVar(&o.directionName, "direction", "auto", "UPS/RUP direction: auto, forward, or reverse")
+	f.StringVar(&o.directionName, "d", "auto", "alias for --direction")
 	f.Uint64Var(&o.maxOutput, "max-output", 0, "maximum output size in bytes")
 	f.Uint64Var(&o.maxOutput, "m", 0, "alias for --max-output")
 	f.StringVar(&o.output, "output", "", "output file; use - for stdout")
@@ -121,7 +124,7 @@ func (o *applyFlags) options(ctx context.Context, sourceName string) rompatcher.
 	return rompatcher.ApplyOptions{
 		Context: ctx, Validate: o.validate, RemoveHeader: o.remove, AddHeader: o.add,
 		FixChecksum: o.fix, SourceName: sourceName, MaxOutputSize: o.maxOutput,
-		Progress: progressPrinter(o.progress),
+		Direction: o.direction, Progress: progressPrinter(o.progress),
 	}
 }
 
@@ -149,6 +152,7 @@ func apply(ctx context.Context, args []string) error {
 
 examples:
   rompatcher apply game.sfc translation.bps
+  rompatcher apply patched.gba translation.ups -d reverse -o original.gba
   rompatcher apply game.sfc base.bps fix.ips -o final.sfc
   rompatcher apply games.zip patch.bps -s "region/game.sfc" -o game.sfc
 
@@ -159,6 +163,7 @@ options:
   -j, --json               emit machine-readable JSON
   -p, --progress           show progress on stderr
   -m, --max-output BYTES   reject larger outputs
+  -d, --direction MODE     UPS/RUP direction: auto, forward, or reverse
   -s, --source-entry NAME  source entry inside a ZIP
   -e, --patch-entry NAME   patch entry inside a ZIP; repeat for ZIP patches in order
       --add-header         temporarily add a recognized ROM header
@@ -174,6 +179,14 @@ options:
 	if o.remove && o.add {
 		return errors.New("--remove-header and --add-header cannot be used together")
 	}
+	direction, err := rompatcher.ParseApplyDirection(o.directionName)
+	if err != nil {
+		return err
+	}
+	if direction != rompatcher.ApplyDirectionAuto && f.NArg() != 2 {
+		return errors.New("--direction requires exactly one patch")
+	}
+	o.direction = direction
 	sourcePath, patchPaths := f.Arg(0), f.Args()[1:]
 	stdinCount := 0
 	if sourcePath == "-" {
@@ -295,15 +308,16 @@ type batchPatch struct {
 	Entry string `json:"entry,omitempty"`
 }
 type batchJob struct {
-	Source       string       `json:"source"`
-	SourceEntry  string       `json:"sourceEntry,omitempty"`
-	Patches      []batchPatch `json:"patches"`
-	Output       string       `json:"output"`
-	Validate     bool         `json:"validate,omitempty"`
-	RemoveHeader bool         `json:"removeHeader,omitempty"`
-	AddHeader    bool         `json:"addHeader,omitempty"`
-	FixChecksum  bool         `json:"fixChecksum,omitempty"`
-	MaxOutput    uint64       `json:"maxOutput,omitempty"`
+	Source       string                    `json:"source"`
+	SourceEntry  string                    `json:"sourceEntry,omitempty"`
+	Patches      []batchPatch              `json:"patches"`
+	Output       string                    `json:"output"`
+	Validate     bool                      `json:"validate,omitempty"`
+	RemoveHeader bool                      `json:"removeHeader,omitempty"`
+	AddHeader    bool                      `json:"addHeader,omitempty"`
+	FixChecksum  bool                      `json:"fixChecksum,omitempty"`
+	Direction    rompatcher.ApplyDirection `json:"direction,omitempty"`
+	MaxOutput    uint64                    `json:"maxOutput,omitempty"`
 }
 type batchManifest struct {
 	Jobs []batchJob `json:"jobs"`
@@ -348,6 +362,13 @@ func batch(ctx context.Context, args []string) error {
 		if job.RemoveHeader && job.AddHeader {
 			return fmt.Errorf("job %d: removeHeader and addHeader cannot both be enabled", index+1)
 		}
+		direction, err := rompatcher.ParseApplyDirection(string(job.Direction))
+		if err != nil {
+			return fmt.Errorf("job %d: %w", index+1, err)
+		}
+		if direction != rompatcher.ApplyDirectionAuto && len(job.Patches) != 1 {
+			return fmt.Errorf("job %d: direction requires exactly one patch", index+1)
+		}
 		if !*dryRun {
 			result, err := func() (rompatcher.ChainResult, error) {
 				sourcePath, sourceName, cleanSource, err := materializeInput(job.Source, job.SourceEntry, rompatcher.InputSource, 0)
@@ -373,7 +394,7 @@ func batch(ctx context.Context, args []string) error {
 				return rompatcher.ApplyFileChainContext(ctx, sourcePath, patchPaths, job.Output, rompatcher.ApplyOptions{
 					Context: ctx, Validate: job.Validate, RemoveHeader: job.RemoveHeader,
 					AddHeader: job.AddHeader, FixChecksum: job.FixChecksum,
-					SourceName: sourceName, MaxOutputSize: job.MaxOutput,
+					SourceName: sourceName, Direction: direction, MaxOutputSize: job.MaxOutput,
 				})
 			}()
 			if err != nil {
@@ -397,7 +418,7 @@ func batch(ctx context.Context, args []string) error {
 		result, err := rompatcher.ApplyChain(source, patches, rompatcher.ApplyOptions{
 			Context: ctx, Validate: job.Validate, RemoveHeader: job.RemoveHeader,
 			AddHeader: job.AddHeader, FixChecksum: job.FixChecksum,
-			SourceName: sourceName, MaxOutputSize: job.MaxOutput,
+			SourceName: sourceName, Direction: direction, MaxOutputSize: job.MaxOutput,
 		})
 		if err != nil {
 			return fmt.Errorf("job %d: %w", index+1, err)

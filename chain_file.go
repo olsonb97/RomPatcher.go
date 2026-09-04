@@ -19,6 +19,10 @@ func ApplyFileChainContext(ctx context.Context, sourcePath string, patchPaths []
 	if len(patchPaths) == 0 {
 		return result, fmt.Errorf("patch chain is empty")
 	}
+	opts, err = normalizeChainOptions(len(patchPaths), opts)
+	if err != nil {
+		return result, err
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}

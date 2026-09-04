@@ -1238,6 +1238,15 @@ func TestReversiblePatchesWithTemporaryHeaderAndDifferentSizes(t *testing.T) {
 }
 
 func TestApplyDirectionValidation(t *testing.T) {
+	for input, want := range map[string]ApplyDirection{
+		"": ApplyDirectionAuto, " auto ": ApplyDirectionAuto,
+		"FORWARD": ApplyDirectionForward, "reverse": ApplyDirectionReverse,
+	} {
+		got, err := ParseApplyDirection(input)
+		if err != nil || got != want {
+			t.Fatalf("ParseApplyDirection(%q) = %q, %v; want %q", input, got, err, want)
+		}
+	}
 	patch, err := Create([]byte{1}, []byte{2}, FormatIPS, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -1251,6 +1260,12 @@ func TestApplyDirectionValidation(t *testing.T) {
 	}
 	if _, err := Apply([]byte{1}, encoded, ApplyOptions{Direction: ApplyDirectionReverse}); !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("non-reversible direction error = %v", err)
+	}
+	if _, err := Apply([]byte{1}, encoded, ApplyOptions{Direction: ApplyDirectionForward}); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("non-reversible forward direction error = %v", err)
+	}
+	if _, err := ApplyChain([]byte{1}, [][]byte{encoded, encoded}, ApplyOptions{Direction: ApplyDirectionReverse}); err == nil || !strings.Contains(err.Error(), "exactly one patch") {
+		t.Fatalf("multi-patch direction error = %v", err)
 	}
 }
 
