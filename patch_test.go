@@ -549,8 +549,7 @@ func TestIPS32FinalProgressCancellation(t *testing.T) {
 
 func TestHashReader(t *testing.T) {
 	want := HashBytes(testOriginal)
-	//lint:ignore SA1012 HashReader intentionally documents and supports a nil context.
-	got, err := HashReader(nil, bytes.NewReader(testOriginal))
+	got, err := HashReader(context.Background(), bytes.NewReader(testOriginal))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -881,8 +880,7 @@ func assertReaderAtError(t *testing.T, source, patch []byte, validate bool) erro
 		t.Fatal(err)
 	}
 	defer out.Close()
-	//lint:ignore SA1012 ApplyReaderAt intentionally documents and supports a nil context.
-	_, err = ApplyReaderAt(nil, bytes.NewReader(source), int64(len(source)), bytes.NewReader(patch), int64(len(patch)), out, ApplyOptions{Validate: validate})
+	_, err = ApplyReaderAt(context.Background(), bytes.NewReader(source), int64(len(source)), bytes.NewReader(patch), int64(len(patch)), out, ApplyOptions{Validate: validate})
 	return err
 }
 
@@ -1126,16 +1124,13 @@ func TestNilPublicInputsReturnErrors(t *testing.T) {
 	if inspection := InspectParsed(nilPatch); inspection.Format != "" {
 		t.Fatalf("typed nil inspection = %+v", inspection)
 	}
-	//lint:ignore SA1012 nil context support is part of the public API contract.
-	if _, err := ApplyReaderAt(nil, nil, 0, bytes.NewReader([]byte("PATCHEOF")), 8, &memoryFile{}, ApplyOptions{}); err == nil {
+	if _, err := ApplyReaderAt(context.Background(), nil, 0, bytes.NewReader([]byte("PATCHEOF")), 8, &memoryFile{}, ApplyOptions{}); err == nil {
 		t.Fatal("nil source reader was accepted")
 	}
-	//lint:ignore SA1012 nil context support is part of the public API contract.
-	if _, err := CreateReaderAt(nil, bytes.NewReader(nil), 0, bytes.NewReader(nil), 0, nil, FormatIPS, nil); err == nil {
+	if _, err := CreateReaderAt(context.Background(), bytes.NewReader(nil), 0, bytes.NewReader(nil), 0, nil, FormatIPS, nil); err == nil {
 		t.Fatal("nil creation writer was accepted")
 	}
-	//lint:ignore SA1012 nil context support is part of the public API contract.
-	if _, err := HashReader(nil, nil); err == nil {
+	if _, err := HashReader(context.Background(), nil); err == nil {
 		t.Fatal("nil hash reader was accepted")
 	}
 	if _, err := ExtractZIP("missing.zip", "", InputAny, 0, nil); err == nil {
