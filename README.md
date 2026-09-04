@@ -53,6 +53,10 @@ go install github.com/olsonb97/RomPatcher.go/cmd/rompatcher@latest
 output, err := rompatcher.Apply(sourceBytes, patchBytes,
     rompatcher.ApplyOptions{Validate: true})
 
+// Select an endpoint explicitly when automatic UPS/RUP detection is ambiguous.
+output, err = rompatcher.Apply(sourceBytes, patchBytes,
+    rompatcher.ApplyOptions{Direction: rompatcher.ApplyDirectionReverse})
+
 created, err := rompatcher.Create(original, modified, rompatcher.FormatBPS, nil)
 patchBytes, err := created.MarshalBinary()
 
@@ -64,9 +68,11 @@ size, err = rompatcher.CreateReaderAt(ctx, originalFile, originalSize,
 ```
 
 `ApplyOptions` supports cancellation, progress callbacks, an output-size limit,
-temporary iNES, FDS, Lynx, or SNES copier-header handling, and Game Boy or Mega
-Drive/Genesis internal checksum repair. The default output limit is 64 MiB plus
-twice the source size.
+explicit UPS/RUP direction, temporary iNES, FDS, Lynx, or SNES header-sized
+compatibility data, and Game Boy or Mega Drive/Genesis internal checksum repair.
+`CanAddHeaderSize` and `DetectHeaderSize` expose size-only header checks for
+file-backed callers. The default output limit is 64 MiB plus twice the source
+size.
 
 `ApplyReaderAt` and `ApplyFile` keep the source and output file-backed for every
 supported format and decode patch records incrementally. `CreateReaderAt` and

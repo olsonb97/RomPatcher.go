@@ -41,7 +41,7 @@ func sourceSizeMismatch(format Format, actual int64, opts ApplyOptions, expected
 		detail += "; patch accepts " + strings.Join(values, " or ") + " bytes"
 	}
 	if actual >= 0 {
-		if header := canAddHeaderSize(actual, opts.SourceName); header != nil {
+		if header := CanAddHeaderSize(actual, opts.SourceName); header != nil {
 			for size := range seen {
 				if size == uint64(actual)+uint64(header.Size) {
 					return fmt.Errorf("%w: %s (a recognized %d-byte file header); try --add-header", ErrSourceMismatch, detail, header.Size)

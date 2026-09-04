@@ -468,6 +468,22 @@ func TestHeaderAndChecksum(t *testing.T) {
 	}
 }
 
+func TestHeaderDetectionBySize(t *testing.T) {
+	const largeROMSize = int64(8 << 20)
+	if got := CanAddHeaderSize(largeROMSize, "game.sfc"); got == nil || got.Size != 512 {
+		t.Fatalf("large headerless ROM = %+v", got)
+	}
+	if got := DetectHeaderSize(largeROMSize+512, "game.sfc"); got == nil || got.Size != 512 {
+		t.Fatalf("large headered ROM = %+v", got)
+	}
+	if got := DetectHeaderSize(largeROMSize, "game.sfc"); got != nil {
+		t.Fatalf("headerless ROM detected as headered: %+v", got)
+	}
+	if got := CanAddHeaderSize(-1, "game.sfc"); got != nil {
+		t.Fatalf("negative size accepted: %+v", got)
+	}
+}
+
 func TestTemporaryHeaders(t *testing.T) {
 	plain := make([]byte, 1024)
 	modified := append([]byte(nil), plain...)
@@ -1170,6 +1186,71 @@ func TestSourceMismatchSuggestsTemporaryHeader(t *testing.T) {
 		if !errors.Is(err, ErrSourceMismatch) || !strings.Contains(err.Error(), "prevents strict whole-file checksum validation") || !strings.Contains(err.Error(), "without validation") {
 			t.Fatalf("%s synthetic header validation error = %v", format, err)
 		}
+	}
+}
+
+func TestReversiblePatchesWithTemporaryHeaderAndDifferentSizes(t *testing.T) {
+	original := make([]byte, 0x40000)
+	for i := range original {
+		original[i] = byte(i)
+	}
+	modified := make([]byte, 0x80000)
+	copy(modified, original)
+	for i := len(original); i < len(modified); i++ {
+		modified[i] = byte(i*7 + 3)
+	}
+	modified[12345] ^= 0x80
+
+	patchOriginal := append(bytes.Repeat([]byte{0x5a}, 512), original...)
+	patchModified := append(bytes.Repeat([]byte{0x5a}, 512), modified...)
+	for _, format := range []Format{FormatUPS, FormatRUP} {
+		patch, err := Create(patchOriginal, patchModified, format, nil)
+		if err != nil {
+			t.Fatalf("create %s: %v", format, err)
+		}
+		encoded, err := patch.MarshalBinary()
+		if err != nil {
+			t.Fatalf("encode %s: %v", format, err)
+		}
+		for name, test := range map[string]struct {
+			source    []byte
+			direction ApplyDirection
+			want      []byte
+		}{
+			"automatic forward": {source: original, want: modified},
+			"automatic reverse": {source: modified, want: original},
+			"explicit forward":  {source: original, direction: ApplyDirectionForward, want: modified},
+			"explicit reverse":  {source: modified, direction: ApplyDirectionReverse, want: original},
+		} {
+			got, err := Apply(test.source, encoded, ApplyOptions{
+				AddHeader:  true,
+				SourceName: "game.sfc",
+				Direction:  test.direction,
+			})
+			if err != nil {
+				t.Fatalf("%s %s: %v", format, name, err)
+			}
+			if !bytes.Equal(got, test.want) {
+				t.Fatalf("%s %s output mismatch", format, name)
+			}
+		}
+	}
+}
+
+func TestApplyDirectionValidation(t *testing.T) {
+	patch, err := Create([]byte{1}, []byte{2}, FormatIPS, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := patch.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Apply([]byte{1}, encoded, ApplyOptions{Direction: "sideways"}); err == nil || !strings.Contains(err.Error(), "invalid apply direction") {
+		t.Fatalf("invalid direction error = %v", err)
+	}
+	if _, err := Apply([]byte{1}, encoded, ApplyOptions{Direction: ApplyDirectionReverse}); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("non-reversible direction error = %v", err)
 	}
 }
 

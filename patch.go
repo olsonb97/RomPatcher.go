@@ -41,6 +41,29 @@ const (
 	FormatVCDIFF Format = "vcdiff"
 )
 
+// ApplyDirection selects an endpoint for reversible patch formats. Automatic
+// direction detection remains the default.
+type ApplyDirection string
+
+const (
+	// ApplyDirectionAuto selects the endpoint from source size and checksum.
+	ApplyDirectionAuto ApplyDirection = ""
+	// ApplyDirectionForward applies the patch from its source to its target.
+	ApplyDirectionForward ApplyDirection = "forward"
+	// ApplyDirectionReverse applies a reversible patch from target to source.
+	ApplyDirectionReverse ApplyDirection = "reverse"
+)
+
+func normalizeApplyDirection(direction ApplyDirection) (ApplyDirection, error) {
+	direction = ApplyDirection(strings.ToLower(strings.TrimSpace(string(direction))))
+	switch direction {
+	case ApplyDirectionAuto, ApplyDirectionForward, ApplyDirectionReverse:
+		return direction, nil
+	default:
+		return "", fmt.Errorf("invalid apply direction %q", direction)
+	}
+}
+
 // ValidationInfo describes checksums accepted as source validation.
 type ValidationInfo struct {
 	Type   string   `json:"type"`
@@ -61,9 +84,15 @@ type Patch interface {
 type ApplyOptions struct {
 	// Validate enables source and generated-output checks supported by the format.
 	Validate bool
+	// Direction optionally selects forward or reverse application. Auto is the
+	// default and uses endpoint checksums, then unique endpoint sizes when
+	// validation is disabled. Reverse is supported by UPS and RUP.
+	Direction ApplyDirection
 	// RemoveHeader temporarily removes a recognized copier or container header.
 	RemoveHeader bool
-	// AddHeader temporarily adds a recognized copier or container header.
+	// AddHeader temporarily prepends header-sized compatibility data. Generated
+	// bytes are intended for patch offsets and may not form complete container
+	// metadata; they are removed from the finished output.
 	AddHeader bool
 	// FixChecksum repairs a recognized internal ROM checksum after patching.
 	FixChecksum bool

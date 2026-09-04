@@ -34,31 +34,57 @@ func applyUPSStream(ctx context.Context, source io.ReaderAt, sourceSize int64, p
 	actualSize := uint64(sourceSize)
 	var sourceCRC uint32
 	checked := false
-	if opts.Validate || actualSize == declaredTarget {
+	if opts.Validate || opts.Direction == ApplyDirectionAuto && actualSize == declaredTarget {
 		sourceCRC, err = crc32ReaderAt(opts, source, sourceSize, FormatUPS, "validate-source")
 		if err != nil {
 			return 0, err
 		}
 		checked = true
 	}
-	undo := checked && !(actualSize == declaredSource && sourceCRC == footer[0]) && actualSize == declaredTarget && sourceCRC == footer[1]
-	if opts.Validate && !undo && !(actualSize == declaredSource && sourceCRC == footer[0]) {
-		if actualSize == declaredSource && actualSize != declaredTarget {
+	sourceMatches := checked && actualSize == declaredSource && sourceCRC == footer[0]
+	targetMatches := checked && actualSize == declaredTarget && sourceCRC == footer[1]
+	undo := false
+	switch opts.Direction {
+	case ApplyDirectionForward:
+		if actualSize != declaredSource {
+			return 0, sourceSizeMismatch(FormatUPS, sourceSize, opts, declaredSource)
+		}
+		if opts.Validate && !sourceMatches {
 			return 0, checksum32Mismatch(ErrSourceMismatch, FormatUPS, "CRC32", footer[0], sourceCRC)
 		}
-		if actualSize == declaredTarget && actualSize != declaredSource {
+	case ApplyDirectionReverse:
+		if actualSize != declaredTarget {
+			return 0, sourceSizeMismatch(FormatUPS, sourceSize, opts, declaredTarget)
+		}
+		undo = true
+		if opts.Validate && !targetMatches {
 			return 0, checksum32Mismatch(ErrSourceMismatch, FormatUPS, "CRC32", footer[1], sourceCRC)
 		}
-		if actualSize == declaredSource && actualSize == declaredTarget {
-			expected := fmt.Sprintf("%08x or %08x", footer[0], footer[1])
-			return 0, checksumMismatch(ErrSourceMismatch, FormatUPS, "CRC32", expected, fmt.Sprintf("%08x", sourceCRC))
+	default:
+		undo = targetMatches && !sourceMatches
+		if !opts.Validate && !sourceMatches && !targetMatches && declaredSource != declaredTarget && actualSize == declaredTarget {
+			// A unique endpoint size still identifies direction when a temporary
+			// generated header prevents checksum matching.
+			undo = true
 		}
-		return 0, sourceSizeMismatch(FormatUPS, sourceSize, opts, declaredSource, declaredTarget)
+		if opts.Validate && !sourceMatches && !targetMatches {
+			if actualSize == declaredSource && actualSize != declaredTarget {
+				return 0, checksum32Mismatch(ErrSourceMismatch, FormatUPS, "CRC32", footer[0], sourceCRC)
+			}
+			if actualSize == declaredTarget && actualSize != declaredSource {
+				return 0, checksum32Mismatch(ErrSourceMismatch, FormatUPS, "CRC32", footer[1], sourceCRC)
+			}
+			if actualSize == declaredSource && actualSize == declaredTarget {
+				expected := fmt.Sprintf("%08x or %08x", footer[0], footer[1])
+				return 0, checksumMismatch(ErrSourceMismatch, FormatUPS, "CRC32", expected, fmt.Sprintf("%08x", sourceCRC))
+			}
+			return 0, sourceSizeMismatch(FormatUPS, sourceSize, opts, declaredSource, declaredTarget)
+		}
 	}
 	targetSize := declaredTarget
 	if undo {
 		targetSize = declaredSource
-	} else if !opts.Validate && declaredSource < actualSize && targetSize < actualSize {
+	} else if opts.Direction == ApplyDirectionAuto && !opts.Validate && declaredSource < actualSize && targetSize < actualSize {
 		targetSize = actualSize
 	}
 	if targetSize > uint64(^uint64(0)>>1) {

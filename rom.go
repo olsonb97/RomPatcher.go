@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-// HeaderInfo describes a recognized copier or container header.
+// HeaderInfo describes a recognized leading header layout.
 type HeaderInfo struct {
 	Name string
 	Size int
@@ -23,13 +23,15 @@ func extension(name string) string {
 	return strings.TrimPrefix(strings.ToLower(filepath.Ext(name)), ".")
 }
 
-// CanAddHeader reports whether a temporary header can be added for name.
+// CanAddHeader reports whether temporary header-sized compatibility data can
+// be prepended to data. Use CanAddHeaderSize when the data is file-backed.
 func CanAddHeader(data []byte, name string) *HeaderInfo {
-	return canAddHeaderSize(int64(len(data)), name)
+	return CanAddHeaderSize(int64(len(data)), name)
 }
 
-func canAddHeaderSize(size int64, name string) *HeaderInfo {
-	if size < 0 || size > 0x600000 {
+// CanAddHeaderSize is CanAddHeader without requiring the file contents.
+func CanAddHeaderSize(size int64, name string) *HeaderInfo {
+	if size < 0 {
 		return nil
 	}
 	ext := extension(name)
@@ -43,15 +45,22 @@ func canAddHeaderSize(size int64, name string) *HeaderInfo {
 	return nil
 }
 
-// DetectHeader reports a recognized header already present in data.
+// DetectHeader reports a recognized leading header already present in data.
+// Detection is based on the filename and size convention; it does not validate
+// every metadata field. Use DetectHeaderSize when the data is file-backed.
 func DetectHeader(data []byte, name string) *HeaderInfo {
-	if len(data) > 0x600200 || len(data)%1024 == 0 {
+	return DetectHeaderSize(int64(len(data)), name)
+}
+
+// DetectHeaderSize is DetectHeader without requiring the file contents.
+func DetectHeaderSize(size int64, name string) *HeaderInfo {
+	if size < 0 {
 		return nil
 	}
 	ext := extension(name)
 	for _, h := range knownHeaders {
 		for _, x := range h.extensions {
-			if ext == x && (len(data)-h.size)%h.multiple == 0 {
+			if ext == x && size >= int64(h.size) && (size-int64(h.size))%int64(h.multiple) == 0 {
 				return &HeaderInfo{Name: h.name, Size: h.size}
 			}
 		}
@@ -68,7 +77,10 @@ func RemoveHeader(data []byte, name string) (header, rom []byte, info *HeaderInf
 	return append([]byte(nil), data[:info.Size]...), append([]byte(nil), data[info.Size:]...), info
 }
 
-// AddHeader prepends a suitable temporary header when the format is recognized.
+// AddHeader prepends temporary header-sized data for patch offset
+// compatibility. The generated prefix is removed after patching and is not
+// guaranteed to contain complete iNES, LNX, or copier metadata. FDS magic and
+// disk count fields are initialized because they can be derived safely.
 func AddHeader(data []byte, name string) ([]byte, *HeaderInfo) {
 	info := CanAddHeader(data, name)
 	if info == nil {
