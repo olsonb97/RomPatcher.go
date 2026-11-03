@@ -16,8 +16,9 @@ const (
 )
 
 // ApplyReaderAt normally applies a patch without loading either input into
-// memory. Header conversion and checksum repair use the compatibility memory
-// path. The returned size is the exact output length. Output must also
+// memory. Header conversion uses the compatibility memory path. Checksum repair
+// stays file-backed when output also implements io.ReaderAt; otherwise it uses
+// the memory adapter. The returned size is the exact output length. Output must also
 // implement io.ReaderAt for formats that copy from already-produced output;
 // *os.File and the package's in-memory adapter both satisfy that requirement.
 func ApplyReaderAt(ctx context.Context, source io.ReaderAt, sourceSize int64, patch io.ReaderAt, patchSize int64, output io.WriterAt, opts ApplyOptions) (int64, error) {
@@ -34,10 +35,16 @@ func ApplyReaderAt(ctx context.Context, source io.ReaderAt, sourceSize int64, pa
 		ctx = context.Background()
 	}
 	opts.Context = ctx
-	if !opts.RemoveHeader && !opts.AddHeader && !opts.FixChecksum {
+	checksumReader, readableOutput := output.(io.ReaderAt)
+	if !opts.RemoveHeader && !opts.AddHeader && (!opts.FixChecksum || readableOutput) {
 		size, err := applyPatchReaderAt(ctx, source, sourceSize, patch, patchSize, output, opts)
 		if err != nil {
 			return 0, err
+		}
+		if opts.FixChecksum {
+			if _, err := fixROMChecksumReaderAt(ctx, checksumReader, output, size, opts.SourceName); err != nil {
+				return 0, err
+			}
 		}
 		if err := reportProgress(opts, Progress{Phase: "complete", Completed: size, Total: size}); err != nil {
 			return 0, err
@@ -45,8 +52,8 @@ func ApplyReaderAt(ctx context.Context, source io.ReaderAt, sourceSize int64, pa
 		return size, nil
 	}
 
-	// Header conversion and platform checksum repair are compatibility features
-	// that inherently operate on a complete ROM. Normal patching stays file-backed.
+	// Header conversion and checksum repair for write-only outputs use the
+	// existing memory adapter. Readable outputs keep checksum repair file-backed.
 	patchData, err := readAllAt(ctx, patch, patchSize, nil)
 	if err != nil {
 		return 0, fmt.Errorf("read patch: %w", err)
@@ -130,6 +137,9 @@ func crc32ReaderAt(opts ApplyOptions, r io.ReaderAt, size int64, format Format, 
 
 func copyRange(opts ApplyOptions, dst io.WriterAt, dstOff int64, src io.ReaderAt, srcOff, size int64, format Format, buf []byte) error {
 	for done := int64(0); done < size; {
+		if err := checkCanceled(opts); err != nil {
+			return err
+		}
 		n := min64(int64(len(buf)), size-done)
 		if err := readAtFull(src, buf[:n], srcOff+done); err != nil {
 			return err
@@ -243,16 +253,27 @@ func ApplyFileContext(ctx context.Context, sourcePath, patchPath, outputPath str
 	if outputPath == "" {
 		outputPath = DefaultPatchedPath(sourcePath)
 	}
-	return atomicOutput(outputPath, func(out *os.File) error {
-		size, err := ApplyReaderAt(ctx, source, sourceInfo.Size(), patch, patchInfo.Size(), out, opts)
+	progress := opts.Progress
+	applyOpts := withoutProgressPhase(opts, "complete")
+	var outputSize int64
+	err = atomicOutput(outputPath, func(out *os.File) error {
+		size, err := ApplyReaderAt(ctx, source, sourceInfo.Size(), patch, patchInfo.Size(), out, applyOpts)
 		if err != nil {
 			return err
 		}
+		outputSize = size
 		if err := out.Truncate(size); err != nil {
 			return fmt.Errorf("truncate output: %w", err)
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if progress != nil {
+		progress(Progress{Phase: "complete", Completed: outputSize, Total: outputSize})
+	}
+	return nil
 }
 
 // CreateFile creates a patch using file-backed I/O and atomic output.
@@ -298,10 +319,27 @@ func CreateFileContext(ctx context.Context, originalPath, modifiedPath, outputPa
 		ext := filepath.Ext(modifiedPath)
 		outputPath = modifiedPath[:len(modifiedPath)-len(ext)] + "." + string(format)
 	}
-	return atomicOutput(outputPath, func(out *os.File) error {
-		_, err := CreateReaderAt(ctx, original, originalInfo.Size(), modified, modifiedInfo.Size(), out, format, &local)
-		return err
+	progress := local.Progress
+	if progress != nil {
+		local.Progress = func(update Progress) {
+			if update.Phase != "complete" {
+				progress(update)
+			}
+		}
+	}
+	var outputSize int64
+	err = atomicOutput(outputPath, func(out *os.File) error {
+		var createErr error
+		outputSize, createErr = CreateReaderAt(ctx, original, originalInfo.Size(), modified, modifiedInfo.Size(), out, format, &local)
+		return createErr
 	})
+	if err != nil {
+		return err
+	}
+	if progress != nil {
+		progress(Progress{Phase: "complete", Format: format, Completed: outputSize, Total: outputSize})
+	}
+	return nil
 }
 
 func atomicOutput(path string, write func(*os.File) error) (err error) {
@@ -350,10 +388,20 @@ func publishTemp(temporary, destination string) error {
 
 // WriteFileAtomic writes data atomically without replacing an existing file.
 func WriteFileAtomic(path string, data []byte) error {
-	return atomicOutput(path, func(out *os.File) error {
+	return WriteFileAtomicFunc(path, func(out io.Writer) error {
 		_, err := out.Write(data)
 		return err
 	})
+}
+
+// WriteFileAtomicFunc streams output through write, then syncs and atomically
+// publishes it without replacing an existing destination. If write fails, the
+// temporary output is removed. The writer is valid only during the callback.
+func WriteFileAtomicFunc(path string, write func(io.Writer) error) error {
+	if write == nil {
+		return fmt.Errorf("output writer callback must be non-nil")
+	}
+	return atomicOutput(path, func(out *os.File) error { return write(out) })
 }
 
 // DefaultPatchedPath inserts " (patched)" before a source file's extension.

@@ -65,9 +65,86 @@ func (s *bpsActionState) advance(actionType int, length uint64, relative int64, 
 	return copyPosition, nil
 }
 
-func (p *BPSPatch) validateActions() error {
+func decodeBPSRelative(encoded uint64) (int64, error) {
+	if encoded>>1 > uint64(^uint64(0)>>1) {
+		return 0, fmt.Errorf("%w: BPS relative offset", ErrInvalidPatch)
+	}
+	relative := int64(encoded >> 1)
+	if encoded&1 != 0 {
+		relative = -relative
+	}
+	return relative, nil
+}
+
+func scanBPSActions(ctx context.Context, d *decoder, end int, sourceSize, targetSize uint64) (int, error) {
+	state := bpsActionState{}
+	count := 0
+	for d.off < end {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		encoded, err := readBPSVLV(d)
+		if err != nil {
+			return 0, err
+		}
+		length := (encoded >> 2) + 1
+		actionType := int(encoded & 3)
+		var relative int64
+		if actionType == bpsSourceCopy || actionType == bpsTargetCopy {
+			raw, err := readBPSVLV(d)
+			if err != nil {
+				return 0, err
+			}
+			relative, err = decodeBPSRelative(raw)
+			if err != nil {
+				return 0, err
+			}
+		}
+		if _, err := state.advance(actionType, length, relative, sourceSize, targetSize); err != nil {
+			return 0, err
+		}
+		if actionType == bpsTargetRead {
+			if length > uint64(end-d.off) {
+				return 0, ErrUnexpectedEnd
+			}
+			if err := d.skip(int(length)); err != nil {
+				return 0, err
+			}
+		}
+		if d.off > end {
+			return 0, ErrUnexpectedEnd
+		}
+		count++
+	}
+	if d.off != end {
+		return 0, fmt.Errorf("%w: BPS footer boundary", ErrInvalidPatch)
+	}
+	if state.position != targetSize {
+		return 0, fmt.Errorf("%w: BPS actions produce %d bytes, expected %d", ErrInvalidPatch, state.position, targetSize)
+	}
+	return count, nil
+}
+
+func (p *BPSPatch) validateActions(ctx context.Context) error {
+	if p.encodedActions != nil {
+		if len(p.actions) != 0 {
+			return fmt.Errorf("%w: conflicting BPS action representations", ErrInvalidPatch)
+		}
+		d := newDecoder(p.encodedActions)
+		count, err := scanBPSActions(ctx, d, len(p.encodedActions), p.SourceSize, p.TargetSize)
+		if err != nil {
+			return err
+		}
+		if count != p.actionCount {
+			return fmt.Errorf("%w: BPS action count", ErrInvalidPatch)
+		}
+		return nil
+	}
 	state := bpsActionState{}
 	for _, action := range p.actions {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if action.length <= 0 {
 			return fmt.Errorf("%w: empty BPS action", ErrInvalidPatch)
 		}
@@ -89,6 +166,8 @@ type BPSPatch struct {
 	SourceSize, TargetSize         uint64
 	Metadata                       string
 	actions                        []bpsAction
+	encodedActions                 []byte
+	actionCount                    int
 	SourceCRC, TargetCRC, PatchCRC uint32
 }
 
@@ -115,15 +194,35 @@ func (p *BPSPatch) Apply(source []byte, options ApplyOptions) ([]byte, error) {
 
 // MarshalBinary implements Patch.
 func (p *BPSPatch) MarshalBinary() ([]byte, error) {
-	if err := p.validateActions(); err != nil {
+	return p.marshalBinaryContext(context.Background())
+}
+
+func (p *BPSPatch) marshalBinaryContext(ctx context.Context) ([]byte, error) {
+	var err error
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := p.validateActions(ctx); err != nil {
 		return nil, err
 	}
 	out := append([]byte{}, "BPS1"...)
 	out = appendBPSVLV(out, p.SourceSize)
 	out = appendBPSVLV(out, p.TargetSize)
 	out = appendBPSVLV(out, uint64(len(p.Metadata)))
-	out = append(out, p.Metadata...)
+	out, err = appendContext(ctx, out, p.Metadata)
+	if err != nil {
+		return nil, err
+	}
+	if p.encodedActions != nil {
+		out, err = appendContext(ctx, out, p.encodedActions)
+		if err != nil {
+			return nil, err
+		}
+	}
 	for _, a := range p.actions {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if a.length <= 0 || a.typ < bpsSourceRead || a.typ > bpsTargetCopy {
 			return nil, fmt.Errorf("%w: empty BPS action", ErrInvalidPatch)
 		}
@@ -133,7 +232,10 @@ func (p *BPSPatch) MarshalBinary() ([]byte, error) {
 			if len(a.data) != a.length {
 				return nil, ErrInvalidPatch
 			}
-			out = append(out, a.data...)
+			out, err = appendContext(ctx, out, a.data)
+			if err != nil {
+				return nil, err
+			}
 		case bpsSourceCopy, bpsTargetCopy:
 			if a.relative == -int64(^uint64(0)>>1)-1 {
 				return nil, fmt.Errorf("%w: BPS relative offset", ErrInvalidPatch)
@@ -149,14 +251,25 @@ func (p *BPSPatch) MarshalBinary() ([]byte, error) {
 	}
 	out = appendU32LE(out, p.SourceCRC)
 	out = appendU32LE(out, p.TargetCRC)
-	crc := CRC32(out)
+	crc, err := crc32BytesContext(ctx, out)
+	if err != nil {
+		return nil, err
+	}
 	out = appendU32LE(out, crc)
-	return out, nil
+	return out, ctx.Err()
 }
 
 func parseBPS(data []byte) (*BPSPatch, error) {
 	if len(data) < 16 {
 		return nil, fmt.Errorf("%w: BPS header", ErrInvalidPatch)
+	}
+	footerDecoder := newDecoder(data[len(data)-4:])
+	wantPatchCRC, err := footerDecoder.u32le()
+	if err != nil {
+		return nil, err
+	}
+	if got := CRC32(data[:len(data)-4]); got != wantPatchCRC {
+		return nil, checksum32Mismatch(ErrPatchMismatch, FormatBPS, "CRC32", wantPatchCRC, got)
 	}
 	d := newDecoder(data)
 	_ = d.seek(4)
@@ -181,41 +294,13 @@ func parseBPS(data []byte) (*BPSPatch, error) {
 		return nil, e
 	}
 	p := &BPSPatch{SourceSize: ss, TargetSize: ts, Metadata: meta}
-	for d.off < len(data)-12 {
-		v, e := readBPSVLV(d)
-		if e != nil {
-			return nil, e
-		}
-		ln, e := checkedInt((v >> 2) + 1)
-		if e != nil {
-			return nil, e
-		}
-		a := bpsAction{typ: int(v & 3), length: ln}
-		switch a.typ {
-		case bpsTargetRead:
-			b, e := d.bytes(ln)
-			if e != nil {
-				return nil, e
-			}
-			a.data = append([]byte(nil), b...)
-		case bpsSourceCopy, bpsTargetCopy:
-			r, e := readBPSVLV(d)
-			if e != nil {
-				return nil, e
-			}
-			a.relative = int64(r >> 1)
-			if r&1 != 0 {
-				a.relative = -a.relative
-			}
-		}
-		if d.off > len(data)-12 {
-			return nil, ErrUnexpectedEnd
-		}
-		p.actions = append(p.actions, a)
+	actionStart := d.off
+	p.actionCount, e = scanBPSActions(context.Background(), d, len(data)-12, ss, ts)
+	if e != nil {
+		return nil, e
 	}
-	if d.off != len(data)-12 {
-		return nil, fmt.Errorf("%w: BPS footer boundary", ErrInvalidPatch)
-	}
+	p.encodedActions = make([]byte, d.off-actionStart)
+	copy(p.encodedActions, data[actionStart:d.off])
 	p.SourceCRC, e = d.u32le()
 	if e != nil {
 		return nil, e
@@ -227,12 +312,6 @@ func parseBPS(data []byte) (*BPSPatch, error) {
 	p.PatchCRC, e = d.u32le()
 	if e != nil {
 		return nil, e
-	}
-	if got := CRC32(data[:len(data)-4]); got != p.PatchCRC {
-		return nil, checksum32Mismatch(ErrPatchMismatch, FormatBPS, "CRC32", p.PatchCRC, got)
-	}
-	if err := p.validateActions(); err != nil {
-		return nil, err
 	}
 	return p, nil
 }

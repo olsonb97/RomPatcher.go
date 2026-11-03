@@ -2,6 +2,7 @@ package rompatcher
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"strings"
 )
@@ -27,8 +28,31 @@ type APSN64Patch struct {
 	records              []apsRecord
 }
 
-func (p *APSN64Patch) validateRecords() error {
+func validateAPSN64Header(headerType, encoding, originalFormat byte, pad []byte) error {
+	if headerType > 1 {
+		return fmt.Errorf("%w: unsupported APS N64 header type %d", ErrInvalidPatch, headerType)
+	}
+	if encoding != 0 {
+		return fmt.Errorf("%w: unsupported APS N64 encoding %d", ErrInvalidPatch, encoding)
+	}
+	if headerType == 1 {
+		if originalFormat > 1 {
+			return fmt.Errorf("%w: unsupported APS N64 original format %d", ErrInvalidPatch, originalFormat)
+		}
+		for _, value := range pad {
+			if value != 0 {
+				return fmt.Errorf("%w: APS N64 reserved header bytes", ErrInvalidPatch)
+			}
+		}
+	}
+	return nil
+}
+
+func (p *APSN64Patch) validateRecords(ctx context.Context) error {
 	for _, r := range p.records {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		length := len(r.data)
 		if r.rleLen > 0 {
 			length = r.rleLen
@@ -48,6 +72,9 @@ func (p *APSN64Patch) Description() string { return p.PatchDescription }
 
 // ValidateSource implements Patch.
 func (p *APSN64Patch) ValidateSource(source []byte) bool {
+	if validateAPSN64Header(p.HeaderType, p.Encoding, p.OriginalFormat, p.Pad[:]) != nil {
+		return false
+	}
 	if p.HeaderType != 1 {
 		return true
 	}
@@ -69,7 +96,17 @@ func (p *APSN64Patch) Apply(source []byte, options ApplyOptions) ([]byte, error)
 
 // MarshalBinary implements Patch.
 func (p *APSN64Patch) MarshalBinary() ([]byte, error) {
-	if err := p.validateRecords(); err != nil {
+	return p.marshalBinaryContext(context.Background())
+}
+
+func (p *APSN64Patch) marshalBinaryContext(ctx context.Context) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := validateAPSN64Header(p.HeaderType, p.Encoding, p.OriginalFormat, p.Pad[:]); err != nil {
+		return nil, err
+	}
+	if err := p.validateRecords(ctx); err != nil {
 		return nil, err
 	}
 	out := append([]byte{}, "APS10"...)
@@ -83,6 +120,9 @@ func (p *APSN64Patch) MarshalBinary() ([]byte, error) {
 	}
 	out = appendU32LE(out, p.TargetSize)
 	for _, r := range p.records {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if r.offset < 0 || uint64(r.offset) > uint64(^uint32(0)) {
 			return nil, ErrInvalidPatch
 		}
@@ -100,7 +140,7 @@ func (p *APSN64Patch) MarshalBinary() ([]byte, error) {
 			out = append(out, r.data...)
 		}
 	}
-	return out, nil
+	return out, ctx.Err()
 }
 func parseAPSN64(data []byte) (*APSN64Patch, error) {
 	d := newDecoder(data)
@@ -143,6 +183,9 @@ func parseAPSN64(data []byte) (*APSN64Patch, error) {
 		}
 		copy(p.Pad[:], b)
 	}
+	if e := validateAPSN64Header(p.HeaderType, p.Encoding, p.OriginalFormat, p.Pad[:]); e != nil {
+		return nil, e
+	}
 	p.TargetSize, e = d.u32le()
 	if e != nil {
 		return nil, e
@@ -183,7 +226,7 @@ func parseAPSN64(data []byte) (*APSN64Patch, error) {
 		}
 		p.records = append(p.records, r)
 	}
-	if e := p.validateRecords(); e != nil {
+	if e := p.validateRecords(context.Background()); e != nil {
 		return nil, e
 	}
 	return p, nil
@@ -202,8 +245,11 @@ type APSGBAPatch struct {
 	records                []apsGBARecord
 }
 
-func (p *APSGBAPatch) validateRecords() error {
+func (p *APSGBAPatch) validateRecords(ctx context.Context) error {
 	for _, r := range p.records {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		end := uint64(r.offset) + apsGBABlockSize
 		if len(r.xor) != apsGBABlockSize || end > uint64(p.SourceSize) || end > uint64(p.TargetSize) {
 			return fmt.Errorf("%w: APS GBA block outside file", ErrInvalidPatch)
@@ -241,22 +287,36 @@ func (p *APSGBAPatch) Apply(source []byte, options ApplyOptions) ([]byte, error)
 
 // MarshalBinary implements Patch.
 func (p *APSGBAPatch) MarshalBinary() ([]byte, error) {
-	if err := p.validateRecords(); err != nil {
+	return p.marshalBinaryContext(context.Background())
+}
+
+func (p *APSGBAPatch) marshalBinaryContext(ctx context.Context) ([]byte, error) {
+	var err error
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := p.validateRecords(ctx); err != nil {
 		return nil, err
 	}
 	out := append([]byte{}, "APS1"...)
 	out = appendU32LE(out, p.SourceSize)
 	out = appendU32LE(out, p.TargetSize)
 	for _, r := range p.records {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if len(r.xor) != apsGBABlockSize {
 			return nil, ErrInvalidPatch
 		}
 		out = appendU32LE(out, r.offset)
 		out = appendU16LE(out, r.sourceCRC)
 		out = appendU16LE(out, r.targetCRC)
-		out = append(out, r.xor...)
+		out, err = appendContext(ctx, out, r.xor)
+		if err != nil {
+			return nil, err
+		}
 	}
-	return out, nil
+	return out, ctx.Err()
 }
 func parseAPSGBA(data []byte) (*APSGBAPatch, error) {
 	const recSize = 4 + 2 + 2 + apsGBABlockSize
@@ -296,7 +356,7 @@ func parseAPSGBA(data []byte) (*APSGBAPatch, error) {
 		r.xor = append([]byte(nil), b...)
 		p.records = append(p.records, r)
 	}
-	if e := p.validateRecords(); e != nil {
+	if e := p.validateRecords(context.Background()); e != nil {
 		return nil, e
 	}
 	return p, nil

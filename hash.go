@@ -102,6 +102,9 @@ func HashReader(ctx context.Context, r io.Reader) (HashInfo, error) {
 			_, _ = sha.Write(buf[:n])
 			size += int64(n)
 		}
+		if canceled := ctx.Err(); canceled != nil {
+			return HashInfo{}, canceled
+		}
 		if err == io.EOF {
 			break
 		}

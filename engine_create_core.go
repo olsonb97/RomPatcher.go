@@ -228,7 +228,7 @@ func CreateReaderAt(ctx context.Context, original io.ReaderAt, originalSize int6
 		if err != nil {
 			return 0, err
 		}
-		encoded, err := patch.MarshalBinary()
+		encoded, err := marshalPatchContext(ctx, patch)
 		if err != nil {
 			return 0, err
 		}

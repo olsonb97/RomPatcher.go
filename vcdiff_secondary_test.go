@@ -8,7 +8,7 @@ import (
 	"github.com/ulikunitz/xz"
 )
 
-func xzSyncFlushFixture(t *testing.T, raw []byte) []byte {
+func xzSyncFlushFixture(t testing.TB, raw []byte) []byte {
 	t.Helper()
 	var encoded bytes.Buffer
 	w, err := (xz.WriterConfig{DictCap: 4096, NoCheckSum: true}).NewWriter(&encoded)

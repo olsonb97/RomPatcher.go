@@ -11,6 +11,40 @@ import (
 	"testing"
 )
 
+func TestWriteFileAtomicFuncLifecycle(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "output")
+	failure := errors.New("producer failed")
+	err := WriteFileAtomicFunc(path, func(w io.Writer) error {
+		_, _ = io.WriteString(w, "partial")
+		return failure
+	})
+	if !errors.Is(err, failure) {
+		t.Fatalf("producer error = %v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("failed output was not cleaned up: %v, %v", entries, err)
+	}
+	if err := WriteFileAtomicFunc(path, nil); err == nil {
+		t.Fatal("nil callback accepted")
+	}
+	if err := WriteFileAtomicFunc(path, func(w io.Writer) error {
+		_, err := io.WriteString(w, "complete")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	if err := WriteFileAtomicFunc(path, func(io.Writer) error { called = true; return nil }); err == nil || called {
+		t.Fatalf("existing destination: err=%v, callback called=%v", err, called)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != "complete" {
+		t.Fatalf("published contents = %q, %v", data, err)
+	}
+}
+
 type limitedReadAt struct {
 	data []byte
 	max  int
@@ -438,6 +472,8 @@ func TestApplyFileChainCancellationDoesNotPublish(t *testing.T) {
 }
 
 func FuzzApplyReaderAtNoPanic(f *testing.F) {
+	nested, _, _ := nestedDictionaryFixture(f, 4096)
+	f.Add([]byte{}, nested)
 	for _, format := range []Format{FormatIPS, FormatIPS32, FormatEBP, FormatUPS, FormatBPS, FormatAPSN64, FormatRUP, FormatPPF} {
 		patch, err := Create(testOriginal, testModified, format, nil)
 		if err != nil {

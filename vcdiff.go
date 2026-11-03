@@ -1,6 +1,10 @@
 package rompatcher
 
-import "fmt"
+import (
+	"bytes"
+	"context"
+	"fmt"
+)
 
 const (
 	vcdDecompress = 0x01
@@ -22,14 +26,12 @@ type vcdWindow struct {
 	sourceLength, sourcePosition, targetLength   int
 	dataLength, instructionLength, addressLength int
 	adler                                        *uint32
-	bodyStart, bodyEnd                           int
 }
 
 // VCDIFFPatch is a parsed VCDIFF/xdelta patch.
 type VCDIFFPatch struct {
 	basePatch
 	data        []byte
-	headerEnd   int
 	table       [256][2]vcdInstruction
 	nearSize    int
 	sameSize    int
@@ -60,196 +62,35 @@ func (*VCDIFFPatch) Format() Format { return FormatVCDIFF }
 // MarshalBinary reports that VCDIFF creation is unsupported.
 func (*VCDIFFPatch) MarshalBinary() ([]byte, error) { return nil, ErrUnsupported }
 
-func parseVCDIFF(data []byte) (*VCDIFFPatch, error) {
-	return parseVCDIFFDepth(data, 0)
-}
-
-func parseVCDIFFDepth(data []byte, depth int) (*VCDIFFPatch, error) {
-	if depth > 4 {
-		return nil, fmt.Errorf("%w: nested VCDIFF code tables", ErrInvalidPatch)
+func parseVCDIFFWithOptions(data []byte, opts ApplyOptions) (*VCDIFFPatch, error) {
+	ctx := contextOf(opts)
+	header, err := parseVCDStreamHeader(ctx, bytes.NewReader(data), int64(len(data)), opts, 0)
+	if err != nil {
+		return nil, err
 	}
-	if len(data) < 5 || data[3] != 0 {
-		return nil, fmt.Errorf("%w: VCDIFF header/version", ErrInvalidPatch)
+	p := &VCDIFFPatch{table: header.table, nearSize: header.nearSize, sameSize: header.sameSize, secondaryID: header.secondaryID}
+	windows := newReaderDecoder(ctx, bytes.NewReader(data), int64(len(data)))
+	if err := windows.seek(header.headerEnd); err != nil {
+		return nil, err
 	}
-	d := newDecoder(data)
-	_ = d.seek(4)
-	indicator, e := d.u8()
-	if e != nil {
-		return nil, e
-	}
-	var secondaryID byte
-	if indicator&vcdDecompress != 0 {
-		secondaryID, e = d.u8()
-		if e != nil {
-			return nil, e
-		}
-	}
-	table, nearSize, sameSize := vcdTable, 4, 3
-	if indicator&vcdCodeTable != 0 {
-		n, e := readBE7(d)
-		if e != nil {
-			return nil, e
-		}
-		if n <= 2 {
-			return nil, fmt.Errorf("%w: VCDIFF code table length", ErrInvalidPatch)
-		}
-		near, e := d.u8()
-		if e != nil {
-			return nil, e
-		}
-		same, e := d.u8()
-		if e != nil {
-			return nil, e
-		}
-		nn, e := checkedInt(n - 2)
-		if e != nil {
-			return nil, e
-		}
-		encoded, e := d.bytes(nn)
-		if e != nil {
-			return nil, e
-		}
-		table, e = decodeVCDCodeTable(encoded, depth+1)
-		if e != nil {
-			return nil, e
-		}
-		nearSize, sameSize = int(near), int(same)
-		if e = validateVCDTable(table, nearSize, sameSize); e != nil {
-			return nil, e
-		}
-	}
-	if indicator&vcdAppHeader != 0 {
-		n, e := readBE7(d)
-		if e != nil {
-			return nil, e
-		}
-		nn, e := checkedInt(n)
-		if e != nil {
-			return nil, e
-		}
-		if e = d.skip(nn); e != nil {
-			return nil, e
-		}
-	}
-	if indicator&^(byte(vcdDecompress|vcdCodeTable|vcdAppHeader)) != 0 {
-		return nil, fmt.Errorf("%w: VCDIFF header flags", ErrInvalidPatch)
-	}
-	p := &VCDIFFPatch{data: append([]byte(nil), data...), headerEnd: d.off, table: table, nearSize: nearSize, sameSize: sameSize, secondaryID: secondaryID}
-	windows := newDecoder(p.data)
-	_ = windows.seek(p.headerEnd)
 	for !windows.eof() {
-		w, err := decodeVCDWindow(windows)
+		w, end, err := decodeVCDWindowReader(windows)
 		if err != nil {
 			return nil, err
 		}
 		if w.deltaIndicator != 0 && p.secondaryID == 0 {
 			return nil, fmt.Errorf("%w: VCDIFF compressed section without a secondary compressor", ErrInvalidPatch)
 		}
-		_ = windows.seek(w.bodyEnd)
+		if err := windows.seek(end); err != nil {
+			return nil, err
+		}
 		p.windowCount++
 	}
+	p.data = make([]byte, len(data))
+	if err := copyBytesContext(ctx, p.data, data); err != nil {
+		return nil, err
+	}
 	return p, nil
-}
-
-func decodeVCDWindow(d *decoder) (vcdWindow, error) {
-	w := vcdWindow{}
-	var e error
-	w.indicator, e = d.u8()
-	if e != nil {
-		return w, e
-	}
-	if w.indicator&^(byte(vcdSource|vcdTarget|vcdAdler32)) != 0 || w.indicator&vcdSource != 0 && w.indicator&vcdTarget != 0 {
-		return w, fmt.Errorf("%w: VCDIFF window flags", ErrInvalidPatch)
-	}
-	if w.indicator&(vcdSource|vcdTarget) != 0 {
-		v, e := readBE7(d)
-		if e != nil {
-			return w, e
-		}
-		w.sourceLength, e = checkedInt(v)
-		if e != nil {
-			return w, e
-		}
-		v, e = readBE7(d)
-		if e != nil {
-			return w, e
-		}
-		w.sourcePosition, e = checkedInt(v)
-		if e != nil {
-			return w, e
-		}
-	}
-	deltaLength, e := readBE7(d)
-	if e != nil {
-		return w, e
-	}
-	deltaStart := d.off
-	v, e := readBE7(d)
-	if e != nil {
-		return w, e
-	}
-	w.targetLength, e = checkedInt(v)
-	if e != nil {
-		return w, e
-	}
-	delta, e := d.u8()
-	if e != nil {
-		return w, e
-	}
-	if delta&^byte(0x07) != 0 {
-		return w, fmt.Errorf("%w: VCDIFF delta indicator", ErrInvalidPatch)
-	}
-	w.deltaIndicator = delta
-	v, e = readBE7(d)
-	if e != nil {
-		return w, e
-	}
-	w.dataLength, e = checkedInt(v)
-	if e != nil {
-		return w, e
-	}
-	v, e = readBE7(d)
-	if e != nil {
-		return w, e
-	}
-	w.instructionLength, e = checkedInt(v)
-	if e != nil {
-		return w, e
-	}
-	v, e = readBE7(d)
-	if e != nil {
-		return w, e
-	}
-	w.addressLength, e = checkedInt(v)
-	if e != nil {
-		return w, e
-	}
-	if w.indicator&vcdAdler32 != 0 {
-		x, e := d.u32be()
-		if e != nil {
-			return w, e
-		}
-		w.adler = &x
-	}
-	w.bodyStart = d.off
-	remaining := d.remaining()
-	if w.dataLength > remaining {
-		return w, ErrUnexpectedEnd
-	}
-	remaining -= w.dataLength
-	if w.instructionLength > remaining {
-		return w, ErrUnexpectedEnd
-	}
-	remaining -= w.instructionLength
-	if w.addressLength > remaining {
-		return w, ErrUnexpectedEnd
-	}
-	total := w.dataLength + w.instructionLength + w.addressLength
-	w.bodyEnd = w.bodyStart + total
-	if uint64(w.bodyEnd-deltaStart) != deltaLength {
-		return w, fmt.Errorf("%w: VCDIFF delta encoding length", ErrInvalidPatch)
-	}
-	return w, nil
 }
 
 type addressCache struct {
@@ -382,22 +223,33 @@ func encodeVCDTable(table [256][2]vcdInstruction) []byte {
 	return out
 }
 
-func decodeVCDCodeTable(encoded []byte, depth int) ([256][2]vcdInstruction, error) {
+func decodeVCDCodeTable(ctx context.Context, encoded []byte, depth int, opts ApplyOptions) ([256][2]vcdInstruction, error) {
 	var table [256][2]vcdInstruction
+	if err := ctx.Err(); err != nil {
+		return table, err
+	}
 	data := encoded
 	if len(data) < 5 || data[0] != 0xd6 || data[1] != 0xc3 || data[2] != 0xc4 {
-		data = append([]byte{0xd6, 0xc3, 0xc4, 0, 0}, data...)
+		var err error
+		data, err = appendContext(ctx, []byte{0xd6, 0xc3, 0xc4, 0, 0}, data)
+		if err != nil {
+			return table, err
+		}
 	}
-	p, err := parseVCDIFFDepth(data, depth)
+	// Table sections have their own budget; the engine checks the exact 1536-byte
+	// output bound before allocating a window. Inherit the caller's dictionary
+	// ceiling before replacing the final-output limit.
+	nested := ApplyOptions{Context: ctx, MaxOutputSize: 64 << 20, MaxWindowSize: opts.MaxWindowSize, MaxDictionarySize: lzmaDictionaryLimit(opts)}
+	source := encodeVCDTable(vcdTable)
+	output := &memoryFile{data: make([]byte, 0, 256*6)}
+	size, err := applyVCDIFFStreamDepth(ctx, bytes.NewReader(source), int64(len(source)), bytes.NewReader(data), int64(len(data)), output, output, nested, depth)
 	if err != nil {
-		return table, fmt.Errorf("%w: VCDIFF custom code table: %v", ErrInvalidPatch, err)
+		return table, fmt.Errorf("VCDIFF custom code table: %w", err)
 	}
-	// A custom table always produces 1536 bytes, but its secondary LZMA stream
-	// may legitimately declare xdelta3's larger default dictionary.
-	raw, err := p.Apply(encodeVCDTable(vcdTable), ApplyOptions{MaxOutputSize: 64 << 20})
-	if err != nil || len(raw) != 256*6 {
+	if size != 256*6 {
 		return table, fmt.Errorf("%w: VCDIFF custom code table output", ErrInvalidPatch)
 	}
+	raw := output.data
 	for field := 0; field < 6; field++ {
 		for i := 0; i < 256; i++ {
 			value := int(raw[field*256+i])
@@ -450,7 +302,7 @@ func (p *VCDIFFPatch) decodeTargetWindow(w vcdWindow, dataSection, instSection, 
 	switch {
 	case w.indicator&vcdSource != 0:
 		if sourceLength > sourceSize || sourcePosition > sourceSize-sourceLength {
-			return nil, fmt.Errorf("%w: VCDIFF source segment", ErrInvalidPatch)
+			return nil, fmt.Errorf("%w: VCDIFF source segment", ErrSourceMismatch)
 		}
 	case w.indicator&vcdTarget != 0:
 		if sourceLength > targetPosition || sourcePosition > targetPosition-sourceLength {

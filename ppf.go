@@ -2,6 +2,7 @@ package rompatcher
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"strings"
 )
@@ -38,8 +39,18 @@ func (p *PPFPatch) undoing(source []byte) bool {
 	if !p.Undo || len(p.records) == 0 {
 		return false
 	}
-	r := p.records[0]
-	return r.offset <= uint64(len(source)) && uint64(len(r.data)) <= uint64(len(source))-r.offset && bytes.Equal(source[int(r.offset):int(r.offset)+len(r.data)], r.data)
+	for _, r := range p.records {
+		if r.offset > uint64(len(source)) || uint64(len(r.data)) > uint64(len(source))-r.offset || len(r.undo) != len(r.data) {
+			continue
+		}
+		current := source[int(r.offset) : int(r.offset)+len(r.data)]
+		dataMatches := bytes.Equal(current, r.data)
+		undoMatches := bytes.Equal(current, r.undo)
+		if dataMatches != undoMatches {
+			return dataMatches
+		}
+	}
+	return false
 }
 
 // ValidateSource implements Patch.
@@ -98,6 +109,14 @@ func (p *PPFPatch) Apply(source []byte, options ApplyOptions) ([]byte, error) {
 
 // MarshalBinary implements Patch.
 func (p *PPFPatch) MarshalBinary() ([]byte, error) {
+	return p.marshalBinaryContext(context.Background())
+}
+
+func (p *PPFPatch) marshalBinaryContext(ctx context.Context) ([]byte, error) {
+	var err error
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if p.Version < 1 || p.Version > 3 {
 		return nil, fmt.Errorf("%w: PPF version", ErrInvalidPatch)
 	}
@@ -127,7 +146,7 @@ func (p *PPFPatch) MarshalBinary() ([]byte, error) {
 		}
 		out = append(out, p.ImageType, block, undo, 0)
 	} else if p.Version == 2 {
-		out = appendU32BE(out, p.InputSize)
+		out = appendU32LE(out, p.InputSize)
 	}
 	if len(p.BlockCheck) > 0 {
 		if len(p.BlockCheck) != 1024 {
@@ -136,6 +155,9 @@ func (p *PPFPatch) MarshalBinary() ([]byte, error) {
 		out = append(out, p.BlockCheck...)
 	}
 	for _, r := range p.records {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if len(r.data) == 0 || len(r.data) > 255 {
 			return nil, fmt.Errorf("%w: PPF record length", ErrInvalidPatch)
 		}
@@ -163,7 +185,10 @@ func (p *PPFPatch) MarshalBinary() ([]byte, error) {
 			return nil, fmt.Errorf("%w: PPF FILE_ID.DIZ is too long", ErrInvalidPatch)
 		}
 		out = append(out, "@BEGIN_FILE_ID.DIZ"...)
-		out = append(out, p.FileID...)
+		out, err = appendContext(ctx, out, p.FileID)
+		if err != nil {
+			return nil, err
+		}
 		out = append(out, "@END_FILE_ID.DIZ"...)
 		if p.Version == 3 {
 			out = appendU16LE(out, uint16(len(p.FileID)))
@@ -171,7 +196,7 @@ func (p *PPFPatch) MarshalBinary() ([]byte, error) {
 			out = appendU32LE(out, uint32(len(p.FileID)))
 		}
 	}
-	return out, nil
+	return out, ctx.Err()
 }
 func parsePPF(data []byte) (*PPFPatch, error) {
 	if len(data) < 56 {
@@ -228,7 +253,7 @@ func parsePPF(data []byte) (*PPFPatch, error) {
 		}
 	} else if p.Version == 2 {
 		p.BlockCheck = make([]byte, 1024)
-		p.InputSize, e = d.u32be()
+		p.InputSize, e = d.u32le()
 		if e != nil {
 			return nil, e
 		}
@@ -260,6 +285,12 @@ func parsePPF(data []byte) (*PPFPatch, error) {
 				declared, e = d.u32le()
 				if e != nil {
 					return nil, fmt.Errorf("%w: PPF FILE_ID.DIZ length", ErrInvalidPatch)
+				}
+			}
+			if p.Version == 3 && d.remaining() == 2 {
+				padding, err := d.u16le()
+				if err != nil || padding != 0 {
+					return nil, fmt.Errorf("%w: PPF FILE_ID.DIZ padding", ErrInvalidPatch)
 				}
 			}
 			if uint64(declared) != uint64(len(p.FileID)) || !d.eof() {

@@ -14,8 +14,25 @@ type vcdStreamHeader struct {
 	headerEnd   int64
 }
 
-func parseVCDStreamHeader(ctx context.Context, patch io.ReaderAt, patchSize int64, opts ApplyOptions, sourceSize uint64) (vcdStreamHeader, error) {
+func vcdWindowLimit(sourceSize uint64, opts ApplyOptions) uint64 {
+	limit := opts.MaxWindowSize
+	if limit == 0 {
+		limit = 128 << 20
+	}
+	if outputLimit := outputSizeLimit(sourceSize, opts); outputLimit < limit {
+		limit = outputLimit
+	}
+	return limit
+}
+
+func parseVCDStreamHeader(ctx context.Context, patch io.ReaderAt, patchSize int64, opts ApplyOptions, depth int) (vcdStreamHeader, error) {
 	header := vcdStreamHeader{table: vcdTable, nearSize: 4, sameSize: 3}
+	if err := ctx.Err(); err != nil {
+		return header, err
+	}
+	if depth > 4 {
+		return header, fmt.Errorf("%w: nested VCDIFF code tables", ErrInvalidPatch)
+	}
 	if patchSize < 5 {
 		return header, fmt.Errorf("%w: VCDIFF header", ErrInvalidPatch)
 	}
@@ -48,14 +65,14 @@ func parseVCDStreamHeader(ctx context.Context, patch io.ReaderAt, patchSize int6
 			return header, err
 		}
 		encodedSize := length - 2
-		if encodedSize > outputSizeLimit(sourceSize, opts) {
+		if encodedSize > 64<<20 {
 			return header, ErrOutputTooLarge
 		}
 		encoded, err := d.bytes(int64(encodedSize))
 		if err != nil {
 			return header, err
 		}
-		header.table, err = decodeVCDCodeTable(encoded, 1)
+		header.table, err = decodeVCDCodeTable(ctx, encoded, depth+1, opts)
 		if err != nil {
 			return header, err
 		}
@@ -155,9 +172,12 @@ func decodeVCDWindowReader(d *readerDecoder) (vcdWindow, int64, error) {
 		w.adler = &checksum
 	}
 	bodyStart := d.off
-	total := int64(w.dataLength) + int64(w.instructionLength) + int64(w.addressLength)
-	if total < 0 || total > d.remaining() {
-		return w, 0, ErrUnexpectedEnd
+	var total int64
+	for _, length := range [...]int{w.dataLength, w.instructionLength, w.addressLength} {
+		if int64(length) > d.remaining()-total {
+			return w, 0, ErrUnexpectedEnd
+		}
+		total += int64(length)
 	}
 	bodyEnd := bodyStart + total
 	if uint64(bodyEnd-deltaStart) != deltaLength {
@@ -167,10 +187,13 @@ func decodeVCDWindowReader(d *readerDecoder) (vcdWindow, int64, error) {
 }
 
 func vcdStreamSections(ctx context.Context, patch io.ReaderAt, bodyStart int64, w vcdWindow, decoders *vcdSecondaryDecoders, p *VCDIFFPatch, opts ApplyOptions, sourceSize uint64) ([]byte, []byte, []byte, error) {
-	limit, used := outputSizeLimit(sourceSize, opts), uint64(0)
-	rawTotal := uint64(w.dataLength) + uint64(w.instructionLength) + uint64(w.addressLength)
-	if rawTotal > limit {
-		return nil, nil, nil, ErrOutputTooLarge
+	limit, used := vcdWindowLimit(sourceSize, opts), uint64(0)
+	var rawTotal uint64
+	for _, length := range [...]int{w.dataLength, w.instructionLength, w.addressLength} {
+		if uint64(length) > limit-rawTotal {
+			return nil, nil, nil, fmt.Errorf("%w: VCDIFF sections exceed %d bytes", ErrOutputTooLarge, limit)
+		}
+		rawTotal += uint64(length)
 	}
 	read := func(offset int64, length int) ([]byte, error) {
 		if err := ctx.Err(); err != nil {
@@ -244,7 +267,11 @@ func vcdStreamSections(ctx context.Context, patch io.ReaderAt, bodyStart int64, 
 }
 
 func applyVCDIFFStream(ctx context.Context, source io.ReaderAt, sourceSize int64, patch io.ReaderAt, patchSize int64, readOutput io.ReaderAt, output io.WriterAt, opts ApplyOptions) (int64, error) {
-	header, err := parseVCDStreamHeader(ctx, patch, patchSize, opts, uint64(sourceSize))
+	return applyVCDIFFStreamDepth(ctx, source, sourceSize, patch, patchSize, readOutput, output, opts, 0)
+}
+
+func applyVCDIFFStreamDepth(ctx context.Context, source io.ReaderAt, sourceSize int64, patch io.ReaderAt, patchSize int64, readOutput io.ReaderAt, output io.WriterAt, opts ApplyOptions, depth int) (int64, error) {
+	header, err := parseVCDStreamHeader(ctx, patch, patchSize, opts, depth)
 	if err != nil {
 		return 0, err
 	}
@@ -264,8 +291,14 @@ func applyVCDIFFStream(ctx context.Context, source io.ReaderAt, sourceSize int64
 		if int64(w.targetLength) > int64(^uint64(0)>>1)-targetPosition {
 			return 0, ErrInvalidPatch
 		}
+		if depth > 0 && int64(w.targetLength) > 256*6-targetPosition {
+			return 0, fmt.Errorf("%w: VCDIFF custom code table exceeds 1536 bytes", ErrInvalidPatch)
+		}
 		if err := checkOutputSize64(uint64(targetPosition)+uint64(w.targetLength), uint64(sourceSize), opts); err != nil {
 			return 0, err
+		}
+		if limit := vcdWindowLimit(uint64(sourceSize), opts); uint64(w.targetLength) > limit {
+			return 0, fmt.Errorf("%w: VCDIFF target window exceeds %d bytes", ErrOutputTooLarge, limit)
 		}
 		bodyStart := d.off
 		data, instructions, addresses, err := vcdStreamSections(ctx, patch, bodyStart, w, decoders, p, opts, uint64(sourceSize))

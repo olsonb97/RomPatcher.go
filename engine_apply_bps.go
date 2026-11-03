@@ -71,12 +71,9 @@ func applyBPSStream(ctx context.Context, source io.ReaderAt, sourceSize int64, p
 			if err != nil {
 				return 0, err
 			}
-			if encodedRelative>>1 > uint64(^uint64(0)>>1) {
-				return 0, ErrInvalidPatch
-			}
-			relative = int64(encodedRelative >> 1)
-			if encodedRelative&1 != 0 {
-				relative = -relative
+			relative, err = decodeBPSRelative(encodedRelative)
+			if err != nil {
+				return 0, err
 			}
 		}
 		position := state.position
@@ -123,6 +120,9 @@ func applyBPSStream(ctx context.Context, source io.ReaderAt, sourceSize int64, p
 				}
 			}
 			for copied := int64(0); copied < length64; {
+				if err := ctx.Err(); err != nil {
+					return 0, err
+				}
 				n := int64(fileChunkSize)
 				if length64-copied < n {
 					n = length64 - copied

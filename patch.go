@@ -106,9 +106,16 @@ type ApplyOptions struct {
 	// Progress receives coarse progress updates. Callbacks must return quickly;
 	// they run synchronously with patching.
 	Progress func(Progress)
-	// MaxOutputSize caps allocations from untrusted patches. Zero chooses a
-	// source-relative default (64 MiB plus twice the source size).
+	// MaxOutputSize caps the generated output size. Zero chooses a source-relative
+	// default (64 MiB plus twice the source size).
 	MaxOutputSize uint64
+	// MaxWindowSize caps each VCDIFF target window and its total encoded or
+	// decoded section bytes. Zero uses 128 MiB, reduced by a smaller output
+	// limit. This limit is independent of the cumulative output size.
+	MaxWindowSize uint64
+	// MaxDictionarySize caps each LZMA dictionary used by VCDIFF. Zero uses a
+	// 64 MiB ceiling, reduced by an explicit smaller MaxOutputSize.
+	MaxDictionarySize uint64
 }
 
 // Progress describes a synchronous operation progress update.
@@ -179,6 +186,13 @@ type CreateOptions struct {
 
 // Parse detects and decodes a patch held in memory.
 func Parse(data []byte) (Patch, error) {
+	return parseWithOptions(data, ApplyOptions{})
+}
+
+func parseWithOptions(data []byte, opts ApplyOptions) (Patch, error) {
+	if err := checkCanceled(opts); err != nil {
+		return nil, err
+	}
 	switch {
 	case len(data) >= 5 && string(data[:5]) == "PATCH":
 		return parseIPS(data)
@@ -201,7 +215,7 @@ func Parse(data []byte) (Patch, error) {
 	case len(data) >= 4 && string(data[:4]) == "PMSR":
 		return parsePMSR(data)
 	case len(data) >= 3 && data[0] == 0xd6 && data[1] == 0xc3 && data[2] == 0xc4:
-		return parseVCDIFF(data)
+		return parseVCDIFFWithOptions(data, opts)
 	default:
 		return nil, ErrUnknownFormat
 	}
@@ -224,7 +238,7 @@ func Create(original, modified []byte, format Format, opts *CreateOptions) (Patc
 			if err != nil {
 				return nil, err
 			}
-			encoded, err := p.MarshalBinary()
+			encoded, err := marshalPatchContext(createContext(local), p)
 			if err != nil {
 				return nil, err
 			}

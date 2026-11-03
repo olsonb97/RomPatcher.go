@@ -1083,7 +1083,7 @@ func TestArchiveAnyAndLargeLimit(t *testing.T) {
 
 func TestInMemoryZIPRejectsUnrepresentableEntry(t *testing.T) {
 	entry := &zip.File{FileHeader: zip.FileHeader{Name: "huge.bin", UncompressedSize64: uint64(int(^uint(0)>>1)) + 1}}
-	if _, _, err := selectZIP([]*zip.File{entry}, "huge.bin", InputAny, 0); !errors.Is(err, ErrOutputTooLarge) {
+	if _, _, err := selectZIPContext(context.Background(), []*zip.File{entry}, "huge.bin", InputAny, 0); !errors.Is(err, ErrOutputTooLarge) {
 		t.Fatalf("oversized ZIP entry error = %v", err)
 	}
 }
@@ -1335,6 +1335,8 @@ func TestBPSDeltaHonorsCreationOptions(t *testing.T) {
 }
 
 func FuzzParseNoPanic(f *testing.F) {
+	nested, _, _ := nestedDictionaryFixture(f, 4096)
+	f.Add(nested)
 	f.Add([]byte("PATCHXYZ"))
 	f.Add([]byte{0xd6, 0xc3, 0xc4, 0, 0})
 	f.Fuzz(func(t *testing.T, b []byte) {

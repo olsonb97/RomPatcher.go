@@ -61,6 +61,12 @@ func skipPPFFileID(d *readerDecoder, version int) error {
 					}
 					declared = uint64(value)
 				}
+				if version == 3 && d.remaining() == 2 {
+					padding, err := d.u16le()
+					if err != nil || padding != 0 {
+						return fmt.Errorf("%w: PPF FILE_ID.DIZ padding", ErrInvalidPatch)
+					}
+				}
 				if declared != length || !d.eof() {
 					return fmt.Errorf("%w: PPF FILE_ID.DIZ footer", ErrInvalidPatch)
 				}
@@ -119,7 +125,7 @@ func scanPPFStream(ctx context.Context, source io.ReaderAt, sourceSize int64, pa
 			}
 		}
 	} else if info.version == 2 {
-		info.inputSize, err = d.u32be()
+		info.inputSize, err = d.u32le()
 		if err != nil {
 			return info, err
 		}
@@ -129,8 +135,8 @@ func scanPPFStream(ctx context.Context, source io.ReaderAt, sourceSize int64, pa
 		}
 	}
 	info.recordStart = d.off
-	first := true
-	var dataBuffer, compareBuffer [255]byte
+	undoDirectionKnown := false
+	var dataBuffer, undoBuffer, compareBuffer [255]byte
 	for !d.eof() {
 		fileID, err := ppfAtFileID(patch, d.off, d.remaining())
 		if err != nil {
@@ -159,24 +165,36 @@ func scanPPFStream(ctx context.Context, source io.ReaderAt, sourceSize int64, pa
 		if err != nil || length == 0 || int64(length) > d.remaining() {
 			return info, ErrInvalidPatch
 		}
-		dataOffset := d.off
-		_ = d.skip(int64(length))
-		if first && info.undo {
+		if info.undo && !undoDirectionKnown {
 			data := dataBuffer[:int(length)]
-			if err := readAtFull(patch, data, dataOffset); err != nil {
+			if err := d.read(data); err != nil {
 				return info, err
 			}
-			match, err := ppfBytesEqualAt(source, sourceSize, offset, data, compareBuffer[:])
+			undo := undoBuffer[:int(length)]
+			if err := d.read(undo); err != nil {
+				return info, err
+			}
+			dataMatches, err := ppfBytesEqualAt(source, sourceSize, offset, data, compareBuffer[:])
 			if err != nil {
 				return info, err
 			}
-			info.undoing = match
-		}
-		if info.undo {
-			if int64(length) > d.remaining() {
-				return info, ErrUnexpectedEnd
+			undoMatches, err := ppfBytesEqualAt(source, sourceSize, offset, undo, compareBuffer[:])
+			if err != nil {
+				return info, err
 			}
-			_ = d.skip(int64(length))
+			if dataMatches != undoMatches {
+				info.undoing = dataMatches
+				undoDirectionKnown = true
+			}
+		} else {
+			if err := d.skip(int64(length)); err != nil {
+				return info, err
+			}
+			if info.undo {
+				if err := d.skip(int64(length)); err != nil {
+					return info, err
+				}
+			}
 		}
 		if offset > uint64(^uint64(0)>>1) || int64(offset) > int64(^uint64(0)>>1)-int64(length) {
 			return info, ErrInvalidPatch
@@ -186,7 +204,6 @@ func scanPPFStream(ctx context.Context, source io.ReaderAt, sourceSize int64, pa
 			info.targetSize = end
 		}
 		info.records++
-		first = false
 	}
 	return info, nil
 }

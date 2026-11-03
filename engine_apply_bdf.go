@@ -32,11 +32,11 @@ func applyBDFStream(ctx context.Context, source io.ReaderAt, sourceSize int64, p
 	if err := checkOutputSize64(uint64(targetSize), uint64(sourceSize), opts); err != nil {
 		return 0, err
 	}
-	control := bzip2.NewReader(sectionReader(patch, 32, controlSize))
-	diff := bzip2.NewReader(sectionReader(patch, 32+controlSize, diffSize))
+	control := bzip2.NewReader(contextReader{ctx: ctx, r: sectionReader(patch, 32, controlSize)})
+	diff := bzip2.NewReader(contextReader{ctx: ctx, r: sectionReader(patch, 32+controlSize, diffSize)})
 	extraSize := patchSize - 32 - controlSize - diffSize
-	extra := bzip2.NewReader(sectionReader(patch, 32+controlSize+diffSize, extraSize))
-	oldPosition, newPosition, records := int64(0), int64(0), int64(0)
+	extra := bzip2.NewReader(contextReader{ctx: ctx, r: sectionReader(patch, 32+controlSize+diffSize, extraSize)})
+	oldPosition, newPosition, records, seekOnlyRecords := int64(0), int64(0), int64(0), int64(0)
 	diffBuf, oldBuf := make([]byte, fileChunkSize), make([]byte, fileChunkSize)
 	for newPosition < targetSize {
 		if err := ctx.Err(); err != nil {
@@ -44,26 +44,47 @@ func applyBDFStream(ctx context.Context, source io.ReaderAt, sourceSize int64, p
 		}
 		diffLength, err := readBSDiffInt(control)
 		if err != nil {
+			if canceled := ctx.Err(); canceled != nil {
+				return 0, canceled
+			}
 			return 0, fmt.Errorf("%w: BSDIFF control tuple: %v", ErrInvalidPatch, err)
 		}
 		extraLength, err := readBSDiffInt(control)
 		if err != nil {
+			if canceled := ctx.Err(); canceled != nil {
+				return 0, canceled
+			}
 			return 0, fmt.Errorf("%w: BSDIFF control tuple: %v", ErrInvalidPatch, err)
 		}
 		skip, err := readBSDiffInt(control)
 		if err != nil {
+			if canceled := ctx.Err(); canceled != nil {
+				return 0, canceled
+			}
 			return 0, fmt.Errorf("%w: BSDIFF control tuple: %v", ErrInvalidPatch, err)
 		}
-		if diffLength < 0 || extraLength < 0 || diffLength == 0 && extraLength == 0 || diffLength > targetSize-newPosition || extraLength > targetSize-newPosition-diffLength {
+		if diffLength < 0 || extraLength < 0 || diffLength == 0 && extraLength == 0 && skip == 0 || diffLength > targetSize-newPosition || extraLength > targetSize-newPosition-diffLength {
 			return 0, fmt.Errorf("%w: BSDIFF control values", ErrInvalidPatch)
 		}
+		if diffLength == 0 && extraLength == 0 {
+			seekOnlyRecords++
+			if seekOnlyRecords > 1024 && seekOnlyRecords-1024 > targetSize {
+				return 0, fmt.Errorf("%w: too many BSDIFF source-only seeks", ErrInvalidPatch)
+			}
+		}
 		for done := int64(0); done < diffLength; {
+			if err := ctx.Err(); err != nil {
+				return 0, err
+			}
 			n := int64(len(diffBuf))
 			if diffLength-done < n {
 				n = diffLength - done
 			}
 			buf := diffBuf[:n]
 			if _, err := io.ReadFull(diff, buf); err != nil {
+				if canceled := ctx.Err(); canceled != nil {
+					return 0, canceled
+				}
 				return 0, fmt.Errorf("%w: BSDIFF diff: %v", ErrInvalidPatch, err)
 			}
 			diffPosition, ok := addInt64(oldPosition, done)
@@ -92,12 +113,18 @@ func applyBDFStream(ctx context.Context, source io.ReaderAt, sourceSize int64, p
 			return 0, ErrInvalidPatch
 		}
 		for done := int64(0); done < extraLength; {
+			if err := ctx.Err(); err != nil {
+				return 0, err
+			}
 			n := int64(len(diffBuf))
 			if extraLength-done < n {
 				n = extraLength - done
 			}
 			buf := diffBuf[:n]
 			if _, err := io.ReadFull(extra, buf); err != nil {
+				if canceled := ctx.Err(); canceled != nil {
+					return 0, canceled
+				}
 				return 0, fmt.Errorf("%w: BSDIFF extra: %v", ErrInvalidPatch, err)
 			}
 			if err := writeAtFull(output, buf, newPosition+done); err != nil {
@@ -116,12 +143,21 @@ func applyBDFStream(ctx context.Context, source io.ReaderAt, sourceSize int64, p
 		}
 	}
 	if err := requireCompressedEOF(control, "control"); err != nil {
+		if canceled := ctx.Err(); canceled != nil {
+			return 0, canceled
+		}
 		return 0, err
 	}
 	if err := requireCompressedEOF(diff, "diff"); err != nil {
+		if canceled := ctx.Err(); canceled != nil {
+			return 0, canceled
+		}
 		return 0, err
 	}
 	if err := requireCompressedEOF(extra, "extra"); err != nil {
+		if canceled := ctx.Err(); canceled != nil {
+			return 0, canceled
+		}
 		return 0, err
 	}
 	return targetSize, nil

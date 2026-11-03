@@ -2,6 +2,29 @@ package rompatcher
 
 import "fmt"
 
+func addBPSVLVByte(value, shift uint64, x byte) (uint64, uint64, bool, error) {
+	digit := uint64(x & 0x7f)
+	if digit != 0 && shift > ^uint64(0)/digit {
+		return 0, 0, false, fmt.Errorf("%w: variable integer overflow", ErrInvalidPatch)
+	}
+	add := digit * shift
+	if value > ^uint64(0)-add {
+		return 0, 0, false, fmt.Errorf("%w: variable integer overflow", ErrInvalidPatch)
+	}
+	value += add
+	if x&0x80 != 0 {
+		return value, shift, true, nil
+	}
+	if shift > ^uint64(0)>>7 {
+		return 0, 0, false, fmt.Errorf("%w: variable integer overflow", ErrInvalidPatch)
+	}
+	shift <<= 7
+	if value > ^uint64(0)-shift {
+		return 0, 0, false, fmt.Errorf("%w: variable integer overflow", ErrInvalidPatch)
+	}
+	return value + shift, shift, false, nil
+}
+
 func readBPSVLV(d *decoder) (uint64, error) {
 	var value, shift uint64 = 0, 1
 	for i := 0; i < 10; i++ {
@@ -9,22 +32,14 @@ func readBPSVLV(d *decoder) (uint64, error) {
 		if err != nil {
 			return 0, err
 		}
-		add := uint64(x&0x7f) * shift
-		if value > ^uint64(0)-add {
-			return 0, fmt.Errorf("%w: variable integer overflow", ErrInvalidPatch)
+		var done bool
+		value, shift, done, err = addBPSVLVByte(value, shift, x)
+		if err != nil {
+			return 0, err
 		}
-		value += add
-		if x&0x80 != 0 {
+		if done {
 			return value, nil
 		}
-		if shift > ^uint64(0)>>7 {
-			return 0, fmt.Errorf("%w: variable integer overflow", ErrInvalidPatch)
-		}
-		shift <<= 7
-		if value > ^uint64(0)-shift {
-			return 0, fmt.Errorf("%w: variable integer overflow", ErrInvalidPatch)
-		}
-		value += shift
 	}
 	return 0, fmt.Errorf("%w: variable integer too long", ErrInvalidPatch)
 }

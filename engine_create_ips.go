@@ -1,7 +1,6 @@
 package rompatcher
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 )
@@ -102,11 +101,9 @@ func createIPSFamilyReaderAt(original io.ReaderAt, originalSize int64, modified 
 		}
 	}
 	if opts.Description != "" {
-		if _, exists := metadata["Description"]; !exists {
-			metadata["Description"] = opts.Description
-		}
+		metadata["Description"] = opts.Description
 	}
-	encoded, err := json.Marshal(metadata)
+	encoded, err := marshalEBPMetadata(w.ctx, metadata)
 	if err != nil {
 		return err
 	}

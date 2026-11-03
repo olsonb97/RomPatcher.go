@@ -41,8 +41,8 @@ func applyUPSStream(ctx context.Context, source io.ReaderAt, sourceSize int64, p
 		}
 		checked = true
 	}
-	sourceMatches := checked && actualSize == declaredSource && sourceCRC == footer[0]
-	targetMatches := checked && actualSize == declaredTarget && sourceCRC == footer[1]
+	sourceMatches, targetMatches := matchReversibleEndpoints(actualSize, declaredSource, declaredTarget, sourceCRC, footer[0], footer[1])
+	sourceMatches, targetMatches = checked && sourceMatches, checked && targetMatches
 	undo := false
 	switch opts.Direction {
 	case ApplyDirectionForward:

@@ -1,6 +1,7 @@
 package rompatcher
 
 import (
+	"context"
 	"fmt"
 )
 
@@ -22,8 +23,17 @@ func (*UPSPatch) Format() Format { return FormatUPS }
 
 // ValidateSource implements Patch and accepts either reversible endpoint.
 func (p *UPSPatch) ValidateSource(source []byte) bool {
-	size, sum := uint64(len(source)), CRC32(source)
-	return size == p.SourceSize && sum == p.SourceCRC || size == p.TargetSize && sum == p.TargetCRC
+	valid, _ := p.validateSourceContext(context.Background(), source, ApplyDirectionAuto)
+	return valid
+}
+
+func (p *UPSPatch) validateSourceContext(ctx context.Context, source []byte, direction ApplyDirection) (bool, error) {
+	sum, err := crc32BytesContext(ctx, source)
+	if err != nil {
+		return false, err
+	}
+	forward, reverse := matchReversibleEndpoints(uint64(len(source)), p.SourceSize, p.TargetSize, sum, p.SourceCRC, p.TargetCRC)
+	return acceptsEndpoint(direction, forward, reverse), nil
 }
 
 // ValidationInfo implements Patch.
@@ -31,13 +41,16 @@ func (p *UPSPatch) ValidationInfo() *ValidationInfo {
 	return &ValidationInfo{Type: "CRC32", Values: []string{fmt.Sprintf("%08x", p.SourceCRC), fmt.Sprintf("%08x", p.TargetCRC)}}
 }
 
-func (p *UPSPatch) validateRecords() error {
+func (p *UPSPatch) validateRecords(ctx context.Context) error {
 	maximum := p.SourceSize
 	if p.TargetSize > maximum {
 		maximum = p.TargetSize
 	}
 	var pos uint64
 	for _, r := range p.records {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if len(r.xor) == 0 || pos > ^uint64(0)-r.offset {
 			return fmt.Errorf("%w: invalid UPS record", ErrInvalidPatch)
 		}
@@ -62,21 +75,39 @@ func (p *UPSPatch) Apply(source []byte, options ApplyOptions) ([]byte, error) {
 
 // MarshalBinary implements Patch.
 func (p *UPSPatch) MarshalBinary() ([]byte, error) {
-	if err := p.validateRecords(); err != nil {
+	return p.marshalBinaryContext(context.Background())
+}
+
+func (p *UPSPatch) marshalBinaryContext(ctx context.Context) ([]byte, error) {
+	var err error
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := p.validateRecords(ctx); err != nil {
 		return nil, err
 	}
 	out := append([]byte{}, "UPS1"...)
 	out = appendBPSVLV(out, p.SourceSize)
 	out = appendBPSVLV(out, p.TargetSize)
 	for _, r := range p.records {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		out = appendBPSVLV(out, r.offset)
-		out = append(out, r.xor...)
+		out, err = appendContext(ctx, out, r.xor)
+		if err != nil {
+			return nil, err
+		}
 		out = append(out, 0)
 	}
 	out = appendU32LE(out, p.SourceCRC)
 	out = appendU32LE(out, p.TargetCRC)
-	out = appendU32LE(out, CRC32(out))
-	return out, nil
+	crc, err := crc32BytesContext(ctx, out)
+	if err != nil {
+		return nil, err
+	}
+	out = appendU32LE(out, crc)
+	return out, ctx.Err()
 }
 
 func parseUPS(data []byte) (*UPSPatch, error) {
@@ -127,7 +158,7 @@ func parseUPS(data []byte) (*UPSPatch, error) {
 	if got := CRC32(data[:len(data)-4]); want != got {
 		return nil, checksum32Mismatch(ErrPatchMismatch, FormatUPS, "CRC32", want, got)
 	}
-	if err := p.validateRecords(); err != nil {
+	if err := p.validateRecords(context.Background()); err != nil {
 		return nil, err
 	}
 	return p, nil

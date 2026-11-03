@@ -1,6 +1,9 @@
 package rompatcher
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 const ips32MaxSize = uint64(1) << 32
 
@@ -24,8 +27,18 @@ func (p *IPS32Patch) Apply(source []byte, options ApplyOptions) ([]byte, error) 
 
 // MarshalBinary implements Patch.
 func (p *IPS32Patch) MarshalBinary() ([]byte, error) {
+	return p.marshalBinaryContext(context.Background())
+}
+
+func (p *IPS32Patch) marshalBinaryContext(ctx context.Context) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	out := append([]byte{}, "IPS32"...)
 	for _, r := range p.records {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if r.offset < 0 || uint64(r.offset) >= ips32MaxSize || uint32(r.offset) == 0x45454f46 {
 			return nil, fmt.Errorf("%w: IPS32 offset 0x%x", ErrInvalidPatch, r.offset)
 		}
@@ -49,7 +62,7 @@ func (p *IPS32Patch) MarshalBinary() ([]byte, error) {
 	if p.HasTruncate {
 		out = appendU32BE(out, p.Truncate)
 	}
-	return out, nil
+	return out, ctx.Err()
 }
 
 func parseIPS32(data []byte) (*IPS32Patch, error) {

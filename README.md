@@ -67,20 +67,34 @@ size, err = rompatcher.CreateReaderAt(ctx, originalFile, originalSize,
     modifiedFile, modifiedSize, patchOutput, rompatcher.FormatBPS, nil)
 ```
 
-`ApplyOptions` supports cancellation, progress callbacks, an output-size limit,
+`ApplyOptions` supports cancellation, progress callbacks, output and VCDIFF
+window/dictionary-size limits,
 explicit UPS/RUP direction, temporary iNES, FDS, Lynx, or SNES header-sized
 compatibility data, and Game Boy or Mega Drive/Genesis internal checksum repair.
 `CanAddHeaderSize` and `DetectHeaderSize` expose size-only header checks for
 file-backed callers. The default output limit is 64 MiB plus twice the source
-size.
+size. LZMA dictionaries are allocated at their declared size and default to a
+64 MiB per-dictionary ceiling, including nested VCDIFF custom code tables.
+`MaxWindowSize` defaults to 128 MiB and bounds each VCDIFF target window and
+its encoded/decoded sections independently of the total output. Both default
+limits are reduced by an explicitly smaller output limit; callers may raise
+them for patches requiring larger windows or dictionaries.
 
 `ApplyReaderAt` and `ApplyFile` keep the source and output file-backed for every
 supported format and decode patch records incrementally. `CreateReaderAt` and
 `CreateFile` also keep both input files out of memory unless BPS delta matching
 is explicitly enabled. VCDIFF retains only the current target window. Header
-and checksum compatibility transformations use the memory-backed path.
+compatibility transformations use the memory-backed path. Checksum repair
+reads the output in bounded chunks when it implements `io.ReaderAt` as well as
+`io.WriterAt`, as files do. Write-only outputs use the memory-backed adapter.
 `ApplyFileChain` uses temporary files between patches. `Inspect`, `DryRun`, and
 `ApplyChain` provide their in-memory counterparts.
+
+`ListZIPReader` and `ExtractZIPReaderContext` let callers inspect and extract
+from the same open `*zip.Reader`, including archives backed by a caller-managed
+file handle. The caller owns the reader and output writer; extraction applies
+the same entry selection, size limits, and ZIP checksum validation as the
+path-based APIs.
 
 ## CLI
 
@@ -103,12 +117,17 @@ rompatcher version
 `rompatcher apply SOURCE PATCH [PATCH...]` applies patches from left to right.
 Useful options are `-o` for output, `-v` to validate, `-n` for a dry run, `-j`
 for JSON, and `-d` for UPS/RUP direction. Run `rompatcher apply --help` for the
-rest. Explicit direction accepts `forward` or `reverse` and requires one patch.
+rest. `--max-input` bounds each input or expanded ZIP entry, and
+`--max-dictionary` bounds each VCDIFF LZMA dictionary, and `--max-window` bounds
+each VCDIFF window. Explicit direction
+accepts `forward` or `reverse` and requires one patch.
 
 ZIP files are supported, but 7z files are not. If a ZIP contains multiple
 choices, run `rompatcher archive FILE.zip`, then select one with `-s` for the
 source or `-e` for a patch. Use `-` for stdin or stdout where applicable.
 Existing output files are never overwritten.
+ZIP extraction defaults to 16 GiB for sources and 256 MiB for patches;
+memory-backed input defaults to 512 MiB for sources and 256 MiB for patches.
 
 ### Batch manifests
 
@@ -131,7 +150,8 @@ Existing output files are never overwritten.
 
 Each job requires `source`, `patches`, and `output`; `output` is optional with
 `batch -n`. Optional fields are `sourceEntry`, `validate`, `removeHeader`,
-`addHeader`, `fixChecksum`, `direction`, and `maxOutput`. Direction accepts
+`addHeader`, `fixChecksum`, `direction`, `maxOutput`, `maxInput`, and
+`maxDictionary`, and `maxWindow`. Direction accepts
 `auto`, `forward`, or `reverse` and requires one patch. Each patch requires
 `path` and may include `entry` for ZIP selection.
 

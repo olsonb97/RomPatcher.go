@@ -18,6 +18,91 @@ import (
 	rompatcher "github.com/olsonb97/RomPatcher.go"
 )
 
+type growOnReadContext struct {
+	context.Context
+	grow func()
+}
+
+func (c *growOnReadContext) Err() error {
+	if c.grow != nil {
+		grow := c.grow
+		c.grow = nil
+		grow()
+	}
+	return c.Context.Err()
+}
+
+func TestInputLimitDuringFileGrowth(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "input.bin")
+	if err := os.WriteFile(path, []byte("a"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx := &growOnReadContext{Context: context.Background(), grow: func() {
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		if _, err := f.WriteString("bc"); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	if data, _, err := readInputContext(ctx, path, "", rompatcher.InputAny, 1); err == nil || data != nil {
+		t.Fatalf("growing input escaped limit: %q, %v", data, err)
+	}
+	reader := strings.NewReader("abcd")
+	if _, err := readLimitedInput(context.Background(), reader, 2); err == nil || reader.Len() != 1 {
+		t.Fatalf("read exceeded limit plus sentinel byte: remaining=%d, err=%v", reader.Len(), err)
+	}
+	for _, limit := range []uint64{0, 4, ^uint64(0)} {
+		data, err := readLimitedInput(context.Background(), strings.NewReader("abcd"), limit)
+		if err != nil || string(data) != "abcd" {
+			t.Fatalf("valid input rejected at limit %d: %q, %v", limit, data, err)
+		}
+	}
+}
+
+// The input reader polls Err; HashReader polls Done. Cancel at the transition
+// to hashing to test cancellation after stdin has already been consumed.
+type cancelOnHashContext struct {
+	context.Context
+	cancel context.CancelFunc
+}
+
+func (c cancelOnHashContext) Done() <-chan struct{} {
+	c.cancel()
+	return c.Context.Done()
+}
+
+func TestStdinHashCancellation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stdin")
+	if err := os.WriteFile(path, []byte("abc"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	original := os.Stdin
+	os.Stdin = f
+	defer func() { os.Stdin = original }()
+	output, err := captureStdout(t, func() error { return hashFile(context.Background(), []string{"-", "-j"}) })
+	var hashes rompatcher.HashInfo
+	if err != nil || json.Unmarshal([]byte(output), &hashes) != nil || hashes != rompatcher.HashBytes([]byte("abc")) {
+		t.Fatalf("stdin hashes: %s, %v", output, err)
+	}
+	if _, err := f.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	output, err = captureStdout(t, func() error { return hashFile(cancelOnHashContext{ctx, cancel}, []string{"-", "-j"}) })
+	if !errors.Is(err, context.Canceled) || output != "" {
+		t.Fatalf("canceled stdin hash emitted success: %q, %v", output, err)
+	}
+}
+
 func captureStdout(t *testing.T, fn func() error) (string, error) {
 	t.Helper()
 	old := os.Stdout
@@ -40,11 +125,11 @@ func captureStdout(t *testing.T, fn func() error) (string, error) {
 func TestApplyFlagsAreInterspersedAndConsistent(t *testing.T) {
 	f := flag.NewFlagSet("apply", flag.ContinueOnError)
 	o := addApplyFlags(f)
-	args := []string{"game.sfc", "base.bps", "-v", "fix.ips", "--patch-entry", "base/in.zip", "-e", "fix/in.zip", "-o", "final.sfc", "-j", "-d", "reverse"}
+	args := []string{"game.sfc", "base.bps", "-v", "fix.ips", "--patch-entry", "base/in.zip", "-e", "fix/in.zip", "-o", "final.sfc", "-j", "-d", "reverse", "--max-input", "5", "--max-dictionary", "1048576"}
 	if err := parseInterspersed(f, args); err != nil {
 		t.Fatal(err)
 	}
-	if !o.validate || !o.jsonOutput || o.output != "final.sfc" || o.directionName != "reverse" {
+	if !o.validate || !o.jsonOutput || o.output != "final.sfc" || o.directionName != "reverse" || o.maxInput != 5 || o.maxDictionary != 1048576 {
 		t.Fatalf("flags not parsed: %+v", o)
 	}
 	if !reflect.DeepEqual(f.Args(), []string{"game.sfc", "base.bps", "fix.ips"}) {
@@ -55,6 +140,52 @@ func TestApplyFlagsAreInterspersedAndConsistent(t *testing.T) {
 	}
 }
 
+func TestEndOfOptionsPreservesDashPrefixedFilename(t *testing.T) {
+	f := flag.NewFlagSet("test", flag.ContinueOnError)
+	if err := parseInterspersed(f, []string{"--", "-game.gba"}); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(f.Args(), []string{"-game.gba"}) {
+		t.Fatalf("positionals = %q", f.Args())
+	}
+	if parsedJSONForTest([]string{"--", "--json"}) {
+		t.Fatal("filename after -- was treated as a JSON flag")
+	}
+	if parsedJSONForTest([]string{"--output", "--json", "--unknown"}) {
+		t.Fatal("flag value was treated as a JSON flag")
+	}
+}
+
+func TestMaterializedZIPHonorsLimitAndContext(t *testing.T) {
+	var archive bytes.Buffer
+	zw := zip.NewWriter(&archive)
+	w, err := zw.Create("game.gba")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = w.Write([]byte("expanded"))
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "input.zip")
+	if err := os.WriteFile(path, archive.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, cleanup, err := materializeInputContext(context.Background(), path, "", rompatcher.InputSource, 3); err == nil {
+		cleanup()
+		t.Fatal("oversized ZIP entry was materialized")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, cleanup, err := materializeInputContext(ctx, path, "", rompatcher.InputSource, 1<<20); !errors.Is(err, context.Canceled) {
+		cleanup()
+		t.Fatalf("cancellation error = %v", err)
+	}
+	if inputLimit(rompatcher.InputPatch, true) == 0 || inputLimit(rompatcher.InputSource, true) == 0 {
+		t.Fatal("default extraction limits must be finite")
+	}
+}
+
 func TestDefaultOutputNames(t *testing.T) {
 	if got := defaultOutputPath("games.zip", "region/game.sfc"); got != "game (patched).sfc" {
 		t.Fatalf("ZIP output: %q", got)
@@ -62,13 +193,13 @@ func TestDefaultOutputNames(t *testing.T) {
 	if got := defaultOutputPath(filepath.Join("roms", "game.sfc"), filepath.Join("roms", "game.sfc")); got != filepath.Join("roms", "game (patched).sfc") {
 		t.Fatalf("file output: %q", got)
 	}
-	if !requestedJSON([]string{"file", "-j"}) {
+	if !parsedJSONForTest([]string{"file", "-j"}) {
 		t.Fatal("-j was not recognized")
 	}
-	if requestedJSON([]string{"file", "--json=false"}) {
+	if parsedJSONForTest([]string{"file", "--json=false"}) {
 		t.Fatal("--json=false was treated as enabled")
 	}
-	if !requestedJSON([]string{"file", "-json=true"}) {
+	if !parsedJSONForTest([]string{"file", "-json=true"}) {
 		t.Fatal("-json=true was not recognized")
 	}
 }
@@ -212,10 +343,10 @@ func TestRawInputSizeLimit(t *testing.T) {
 	if err := os.WriteFile(path, []byte("1234"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := readInput(path, "", rompatcher.InputPatch, 3); err == nil {
+	if _, _, err := readInputContext(context.Background(), path, "", rompatcher.InputPatch, 3); err == nil {
 		t.Fatal("readInput ignored the raw-file size limit")
 	}
-	if _, _, _, err := materializeInput(path, "", rompatcher.InputPatch, 3); err == nil {
+	if _, _, _, err := materializeInputContext(context.Background(), path, "", rompatcher.InputPatch, 3); err == nil {
 		t.Fatal("materializeInput ignored the raw-file size limit")
 	}
 }
@@ -262,7 +393,7 @@ func TestCLIWorkflow(t *testing.T) {
 	if err != nil || !bytes.Contains([]byte(text), []byte(`"status": "ok"`)) {
 		t.Fatalf("create: %v, %s", err, text)
 	}
-	text, err = captureStdout(t, func() error { return inspect([]string{patch, "-j"}) })
+	text, err = captureStdout(t, func() error { return inspectContext(context.Background(), []string{patch, "-j"}) })
 	if err != nil || !bytes.Contains([]byte(text), []byte(`"format": "ips"`)) {
 		t.Fatalf("inspect: %v, %s", err, text)
 	}
@@ -309,5 +440,32 @@ func TestCLIWorkflow(t *testing.T) {
 	got, err := os.ReadFile(batchOutput)
 	if err != nil || string(got) != "abdXYZ" {
 		t.Fatalf("batch output: %v, %q", err, got)
+	}
+}
+
+// parsedJSONForTest exercises the same error wrapper used by commands.
+func parsedJSONForTest(args []string) bool {
+	f := flag.NewFlagSet("apply", flag.ContinueOnError)
+	addApplyFlags(f)
+	_ = parseInterspersed(f, args)
+	return commandFailure(f, errors.New("probe")).(*commandError).json
+}
+
+func TestCommandErrorsUseParsedFormat(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		json bool
+	}{
+		{[]string{"output", "--json"}, true},
+		{[]string{"--json", "--json=false"}, false},
+		{[]string{"--", "--json"}, false},
+		{[]string{"--output", "--json"}, false},
+		{[]string{"source", "--json", "--output"}, true},
+	} {
+		err := apply(context.Background(), tc.args)
+		var failure *commandError
+		if !errors.As(err, &failure) || failure.json != tc.json {
+			t.Errorf("args=%q error=%v: wrong JSON preference", tc.args, err)
+		}
 	}
 }

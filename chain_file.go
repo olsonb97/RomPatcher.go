@@ -77,6 +77,9 @@ func ApplyFileChainContext(ctx context.Context, sourcePath string, patchPaths []
 			if err := publishTemp(step.path, outputPath); err != nil {
 				return result, err
 			}
+			if opts.Progress != nil {
+				opts.Progress(Progress{Phase: "complete", Completed: step.size, Total: step.size})
+			}
 			return result, nil
 		}
 
@@ -143,7 +146,7 @@ func applyFileChainStep(ctx context.Context, source *os.File, sourceSize int64, 
 		}
 	}()
 
-	step.size, err = ApplyReaderAt(ctx, source, sourceSize, patch, patchInfo.Size(), temporary, opts)
+	step.size, err = ApplyReaderAt(ctx, source, sourceSize, patch, patchInfo.Size(), temporary, withoutProgressPhase(opts, "complete"))
 	if err != nil {
 		return step, fmt.Errorf("patch %d (%s): %w", index, step.format, err)
 	}

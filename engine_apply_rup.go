@@ -92,8 +92,7 @@ func parseRUPStream(ctx context.Context, patch io.ReaderAt, patchSize int64, sou
 			if !haveFirst {
 				first, haveFirst = current, true
 			}
-			forwardHash := actualSize == current.sourceSize && sourceMD5 == current.sourceMD5
-			reverseHash := actualSize == current.targetSize && sourceMD5 == current.targetMD5
+			forwardHash, reverseHash := matchReversibleEndpoints(actualSize, current.sourceSize, current.targetSize, sourceMD5, current.sourceMD5, current.targetMD5)
 			if !matched {
 				switch direction {
 				case ApplyDirectionForward:
@@ -338,6 +337,9 @@ func applyRUPStream(ctx context.Context, source io.ReaderAt, sourceSize int64, p
 		}
 		buf := make([]byte, fileChunkSize)
 		for done := uint64(0); done < selected.overflowLength; {
+			if err := ctx.Err(); err != nil {
+				return 0, err
+			}
 			n := uint64(len(buf))
 			if selected.overflowLength-done < n {
 				n = selected.overflowLength - done

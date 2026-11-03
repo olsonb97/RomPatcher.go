@@ -3,6 +3,7 @@ package rompatcher
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -53,7 +54,16 @@ func ListZIP(path string) ([]ArchiveEntry, error) {
 		return nil, err
 	}
 	defer r.Close()
-	return describeZIP(r.File), nil
+	return ListZIPReader(&r.Reader), nil
+}
+
+// ListZIPReader lists entries from an already opened ZIP archive. The caller
+// retains ownership of the archive. A nil reader has no entries.
+func ListZIPReader(r *zip.Reader) []ArchiveEntry {
+	if r == nil {
+		return nil
+	}
+	return describeZIP(r.File)
 }
 
 // ListZIPBytes lists entries in an in-memory ZIP archive.
@@ -62,7 +72,7 @@ func ListZIPBytes(data []byte) ([]ArchiveEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	return describeZIP(r.File), nil
+	return ListZIPReader(r), nil
 }
 
 func describeZIP(files []*zip.File) []ArchiveEntry {
@@ -83,17 +93,30 @@ func describeZIP(files []*zip.File) []ArchiveEntry {
 
 // ReadZIP selects and reads one ZIP entry. A zero maxSize means unlimited.
 func ReadZIP(path, entry string, kind InputKind, maxSize uint64) ([]byte, string, error) {
+	return ReadZIPContext(context.Background(), path, entry, kind, maxSize)
+}
+
+// ReadZIPContext is ReadZIP with cancellation support.
+func ReadZIPContext(ctx context.Context, path, entry string, kind InputKind, maxSize uint64) ([]byte, string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	r, err := zip.OpenReader(path)
 	if err != nil {
 		return nil, "", err
 	}
 	defer r.Close()
-	return selectZIP(r.File, entry, kind, maxSize)
+	return selectZIPContext(ctx, r.File, entry, kind, maxSize)
 }
 
 // ExtractZIP selects one ZIP entry and streams it to dst without buffering the
 // entry in memory.
 func ExtractZIP(path, entry string, kind InputKind, maxSize uint64, dst io.Writer) (string, error) {
+	return ExtractZIPContext(context.Background(), path, entry, kind, maxSize, dst)
+}
+
+// ExtractZIPContext is ExtractZIP with cancellation support.
+func ExtractZIPContext(ctx context.Context, path, entry string, kind InputKind, maxSize uint64, dst io.Writer) (string, error) {
 	if isNilInterface(dst) {
 		return "", fmt.Errorf("destination writer must be non-nil")
 	}
@@ -102,6 +125,30 @@ func ExtractZIP(path, entry string, kind InputKind, maxSize uint64, dst io.Write
 		return "", err
 	}
 	defer r.Close()
+	return ExtractZIPReaderContext(ctx, &r.Reader, entry, kind, maxSize, dst)
+}
+
+// ExtractZIPReader selects and streams an entry from an already opened ZIP
+// archive. The caller retains ownership of the archive and destination. A zero
+// maxSize means unlimited. On error, dst may contain partial output.
+func ExtractZIPReader(r *zip.Reader, entry string, kind InputKind, maxSize uint64, dst io.Writer) (string, error) {
+	return ExtractZIPReaderContext(context.Background(), r, entry, kind, maxSize, dst)
+}
+
+// ExtractZIPReaderContext is ExtractZIPReader with cancellation support.
+func ExtractZIPReaderContext(ctx context.Context, r *zip.Reader, entry string, kind InputKind, maxSize uint64, dst io.Writer) (string, error) {
+	if r == nil {
+		return "", fmt.Errorf("archive reader must be non-nil")
+	}
+	if isNilInterface(dst) {
+		return "", fmt.Errorf("destination writer must be non-nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	f, err := findZIP(r.File, entry, kind, maxSize)
 	if err != nil {
 		return "", err
@@ -115,7 +162,7 @@ func ExtractZIP(path, entry string, kind InputKind, maxSize uint64, dst io.Write
 	if maxSize != 0 && maxSize < uint64(^uint64(0)>>1) {
 		reader = io.LimitReader(rc, int64(maxSize)+1)
 	}
-	n, err := io.Copy(dst, reader)
+	n, err := io.Copy(contextWriter{ctx: ctx, w: dst}, contextReader{ctx: ctx, r: reader})
 	if err != nil {
 		return "", err
 	}
@@ -130,14 +177,22 @@ func ExtractZIP(path, entry string, kind InputKind, maxSize uint64, dst io.Write
 
 // ReadZIPBytes selects and reads one entry from an in-memory ZIP archive.
 func ReadZIPBytes(data []byte, entry string, kind InputKind, maxSize uint64) ([]byte, string, error) {
+	return ReadZIPBytesContext(context.Background(), data, entry, kind, maxSize)
+}
+
+// ReadZIPBytesContext is ReadZIPBytes with cancellation support.
+func ReadZIPBytesContext(ctx context.Context, data []byte, entry string, kind InputKind, maxSize uint64) ([]byte, string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	r, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		return nil, "", err
 	}
-	return selectZIP(r.File, entry, kind, maxSize)
+	return selectZIPContext(ctx, r.File, entry, kind, maxSize)
 }
 
-func selectZIP(files []*zip.File, entry string, kind InputKind, maxSize uint64) ([]byte, string, error) {
+func selectZIPContext(ctx context.Context, files []*zip.File, entry string, kind InputKind, maxSize uint64) ([]byte, string, error) {
 	f, err := findZIP(files, entry, kind, maxSize)
 	if err != nil {
 		return nil, "", err
@@ -154,7 +209,7 @@ func selectZIP(files []*zip.File, entry string, kind InputKind, maxSize uint64) 
 	if maxSize != 0 && maxSize < uint64(^uint64(0)>>1) {
 		reader = io.LimitReader(r, int64(maxSize)+1)
 	}
-	b, err := io.ReadAll(reader)
+	b, err := io.ReadAll(contextReader{ctx: ctx, r: reader})
 	if err != nil {
 		return nil, "", err
 	}

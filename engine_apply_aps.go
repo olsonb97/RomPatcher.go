@@ -14,7 +14,8 @@ func applyAPSN64Stream(ctx context.Context, source io.ReaderAt, sourceSize int64
 	if err != nil {
 		return 0, err
 	}
-	if _, err := d.u8(); err != nil {
+	encoding, err := d.u8()
+	if err != nil {
 		return 0, err
 	}
 	if err := d.skip(50); err != nil {
@@ -22,8 +23,11 @@ func applyAPSN64Stream(ctx context.Context, source io.ReaderAt, sourceSize int64
 	}
 	var cartID []byte
 	var cartCRC []byte
+	var originalFormat byte
+	var pad []byte
 	if headerType == 1 {
-		if err := d.skip(1); err != nil {
+		originalFormat, err = d.u8()
+		if err != nil {
 			return 0, err
 		}
 		cartID, err = d.bytes(3)
@@ -34,9 +38,13 @@ func applyAPSN64Stream(ctx context.Context, source io.ReaderAt, sourceSize int64
 		if err != nil {
 			return 0, err
 		}
-		if err := d.skip(5); err != nil {
+		pad, err = d.bytes(5)
+		if err != nil {
 			return 0, err
 		}
+	}
+	if err := validateAPSN64Header(headerType, encoding, originalFormat, pad); err != nil {
+		return 0, err
 	}
 	target, err := d.u32le()
 	if err != nil {
@@ -146,7 +154,8 @@ func applyAPSGBAStream(ctx context.Context, source io.ReaderAt, sourceSize int64
 			return 0, err
 		}
 		start := int64(offset)
-		if start > sourceSize-apsGBABlockSize || start > targetSize-apsGBABlockSize {
+		end := uint64(offset) + apsGBABlockSize
+		if end > uint64(declaredSource) || end > uint64(target) || end > uint64(sourceSize) {
 			return 0, ErrInvalidPatch
 		}
 		if err := readAtFull(source, input, start); err != nil {

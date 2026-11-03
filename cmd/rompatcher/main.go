@@ -41,7 +41,7 @@ func main() {
 	case "create":
 		err = create(ctx, os.Args[2:])
 	case "inspect":
-		err = inspect(os.Args[2:])
+		err = inspectContext(ctx, os.Args[2:])
 	case "archive":
 		err = archive(os.Args[2:])
 	case "hash":
@@ -60,7 +60,8 @@ func main() {
 		if errors.Is(err, flag.ErrHelp) {
 			return
 		}
-		if requestedJSON(os.Args[2:]) {
+		var failure *commandError
+		if errors.As(err, &failure) && failure.json {
 			_ = json.NewEncoder(os.Stderr).Encode(map[string]any{"status": "error", "error": err.Error()})
 		} else {
 			fmt.Fprintln(os.Stderr, "error:", err)
@@ -69,28 +70,32 @@ func main() {
 	}
 }
 
-func requestedJSON(args []string) bool {
-	for _, arg := range args {
-		if arg == "--json" || arg == "-json" || arg == "-j" {
-			return true
-		}
-		for _, prefix := range []string{"--json=", "-json=", "-j="} {
-			if value, found := strings.CutPrefix(arg, prefix); found {
-				enabled, err := strconv.ParseBool(value)
-				if err == nil && enabled {
-					return true
-				}
-			}
+// commandError retains the command's actual parsed output preference.
+type commandError struct {
+	cause error
+	json  bool
+}
+
+func (e *commandError) Error() string { return e.cause.Error() }
+func (e *commandError) Unwrap() error { return e.cause }
+func commandFailure(f *flag.FlagSet, err error) error {
+	if err == nil {
+		return nil
+	}
+	jsonOutput := false
+	if option := f.Lookup("json"); option != nil {
+		if value, ok := option.Value.(flag.Getter); ok {
+			jsonOutput, _ = value.Get().(bool)
 		}
 	}
-	return false
+	return &commandError{cause: err, json: jsonOutput}
 }
 
 type applyFlags struct {
 	validate, remove, add, fix, dryRun, jsonOutput, progress bool
 	output, sourceEntry, directionName                       string
 	direction                                                rompatcher.ApplyDirection
-	maxOutput                                                uint64
+	maxOutput, maxInput, maxDictionary, maxWindow            uint64
 	patchEntries                                             stringList
 }
 
@@ -111,6 +116,9 @@ func addApplyFlags(f *flag.FlagSet) *applyFlags {
 	f.StringVar(&o.directionName, "d", "auto", "alias for --direction")
 	f.Uint64Var(&o.maxOutput, "max-output", 0, "maximum output size in bytes")
 	f.Uint64Var(&o.maxOutput, "m", 0, "alias for --max-output")
+	f.Uint64Var(&o.maxInput, "max-input", 0, "maximum size of each input in bytes")
+	f.Uint64Var(&o.maxDictionary, "max-dictionary", 0, "maximum VCDIFF LZMA dictionary size in bytes")
+	f.Uint64Var(&o.maxWindow, "max-window", 0, "maximum VCDIFF window size in bytes")
 	f.StringVar(&o.output, "output", "", "output file; use - for stdout")
 	f.StringVar(&o.output, "o", "", "alias for --output")
 	f.StringVar(&o.sourceEntry, "source-entry", "", "source entry inside a ZIP")
@@ -124,6 +132,7 @@ func (o *applyFlags) options(ctx context.Context, sourceName string) rompatcher.
 	return rompatcher.ApplyOptions{
 		Context: ctx, Validate: o.validate, RemoveHeader: o.remove, AddHeader: o.add,
 		FixChecksum: o.fix, SourceName: sourceName, MaxOutputSize: o.maxOutput,
+		MaxDictionarySize: o.maxDictionary, MaxWindowSize: o.maxWindow,
 		Direction: o.direction, Progress: progressPrinter(o.progress),
 	}
 }
@@ -144,8 +153,9 @@ func progressPrinter(enabled bool) func(rompatcher.Progress) {
 	}
 }
 
-func apply(ctx context.Context, args []string) error {
+func apply(ctx context.Context, args []string) (err error) {
 	f := flag.NewFlagSet("apply", flag.ContinueOnError)
+	defer func() { err = commandFailure(f, err) }()
 	o := addApplyFlags(f)
 	f.Usage = func() {
 		fmt.Fprintln(f.Output(), `usage: rompatcher apply [options] SOURCE PATCH [PATCH...]
@@ -163,6 +173,9 @@ options:
   -j, --json               emit machine-readable JSON
   -p, --progress           show progress on stderr
   -m, --max-output BYTES   reject larger outputs
+      --max-input BYTES    reject larger inputs or ZIP entries
+      --max-dictionary BYTES reject larger VCDIFF LZMA dictionaries
+      --max-window BYTES   reject larger VCDIFF windows
   -d, --direction MODE     UPS/RUP direction: auto, forward, or reverse
   -s, --source-entry NAME  source entry inside a ZIP
   -e, --patch-entry NAME   patch entry inside a ZIP; repeat for ZIP patches in order
@@ -211,7 +224,7 @@ options:
 		fileBacked = fileBacked && path != "-"
 	}
 	if fileBacked && !o.dryRun {
-		materialSource, sourceName, cleanSource, err := materializeInput(sourcePath, o.sourceEntry, rompatcher.InputSource, 0)
+		materialSource, sourceName, cleanSource, err := materializeInputContext(ctx, sourcePath, o.sourceEntry, rompatcher.InputSource, o.maxInput)
 		if err != nil {
 			return fmt.Errorf("source: %w", err)
 		}
@@ -221,7 +234,7 @@ options:
 		}
 		materialPatches := make([]string, 0, len(patchPaths))
 		for index, patchPath := range patchPaths {
-			materialPatch, _, cleanPatch, err := materializeInput(patchPath, patchEntries[index], rompatcher.InputPatch, 0)
+			materialPatch, _, cleanPatch, err := materializeInputContext(ctx, patchPath, patchEntries[index], rompatcher.InputPatch, o.maxInput)
 			if err != nil {
 				return fmt.Errorf("patch %d: %w", index+1, err)
 			}
@@ -244,7 +257,7 @@ options:
 	if outputPath == "" && sourcePath == "-" && !o.dryRun {
 		return errors.New("stdin sources require -o/--output")
 	}
-	source, sourceName, err := readInput(sourcePath, o.sourceEntry, rompatcher.InputSource, 0)
+	source, sourceName, err := readInputContext(ctx, sourcePath, o.sourceEntry, rompatcher.InputSource, o.maxInput)
 	if err != nil {
 		return fmt.Errorf("source: %w", err)
 	}
@@ -253,7 +266,7 @@ options:
 	}
 	patches := make([][]byte, 0, len(patchPaths))
 	for i, path := range patchPaths {
-		patchData, _, err := readInput(path, patchEntries[i], rompatcher.InputPatch, 256<<20)
+		patchData, _, err := readInputContext(ctx, path, patchEntries[i], rompatcher.InputPatch, o.maxInput)
 		if err != nil {
 			return fmt.Errorf("patch %d: %w", i+1, err)
 		}
@@ -308,23 +321,27 @@ type batchPatch struct {
 	Entry string `json:"entry,omitempty"`
 }
 type batchJob struct {
-	Source       string                    `json:"source"`
-	SourceEntry  string                    `json:"sourceEntry,omitempty"`
-	Patches      []batchPatch              `json:"patches"`
-	Output       string                    `json:"output"`
-	Validate     bool                      `json:"validate,omitempty"`
-	RemoveHeader bool                      `json:"removeHeader,omitempty"`
-	AddHeader    bool                      `json:"addHeader,omitempty"`
-	FixChecksum  bool                      `json:"fixChecksum,omitempty"`
-	Direction    rompatcher.ApplyDirection `json:"direction,omitempty"`
-	MaxOutput    uint64                    `json:"maxOutput,omitempty"`
+	Source        string                    `json:"source"`
+	SourceEntry   string                    `json:"sourceEntry,omitempty"`
+	Patches       []batchPatch              `json:"patches"`
+	Output        string                    `json:"output"`
+	Validate      bool                      `json:"validate,omitempty"`
+	RemoveHeader  bool                      `json:"removeHeader,omitempty"`
+	AddHeader     bool                      `json:"addHeader,omitempty"`
+	FixChecksum   bool                      `json:"fixChecksum,omitempty"`
+	Direction     rompatcher.ApplyDirection `json:"direction,omitempty"`
+	MaxOutput     uint64                    `json:"maxOutput,omitempty"`
+	MaxInput      uint64                    `json:"maxInput,omitempty"`
+	MaxDictionary uint64                    `json:"maxDictionary,omitempty"`
+	MaxWindow     uint64                    `json:"maxWindow,omitempty"`
 }
 type batchManifest struct {
 	Jobs []batchJob `json:"jobs"`
 }
 
-func batch(ctx context.Context, args []string) error {
+func batch(ctx context.Context, args []string) (err error) {
 	f := flag.NewFlagSet("batch", flag.ContinueOnError)
+	defer func() { err = commandFailure(f, err) }()
 	jsonOutput := f.Bool("json", false, "write machine-readable JSON")
 	f.BoolVar(jsonOutput, "j", false, "alias for --json")
 	dryRun := f.Bool("dry-run", false, "run without writing outputs")
@@ -371,7 +388,7 @@ func batch(ctx context.Context, args []string) error {
 		}
 		if !*dryRun {
 			result, err := func() (rompatcher.ChainResult, error) {
-				sourcePath, sourceName, cleanSource, err := materializeInput(job.Source, job.SourceEntry, rompatcher.InputSource, 0)
+				sourcePath, sourceName, cleanSource, err := materializeInputContext(ctx, job.Source, job.SourceEntry, rompatcher.InputSource, job.MaxInput)
 				if err != nil {
 					return rompatcher.ChainResult{}, fmt.Errorf("source: %w", err)
 				}
@@ -384,7 +401,7 @@ func batch(ctx context.Context, args []string) error {
 					}
 				}()
 				for patchIndex, item := range job.Patches {
-					path, _, cleanup, err := materializeInput(item.Path, item.Entry, rompatcher.InputPatch, 0)
+					path, _, cleanup, err := materializeInputContext(ctx, item.Path, item.Entry, rompatcher.InputPatch, job.MaxInput)
 					if err != nil {
 						return rompatcher.ChainResult{}, fmt.Errorf("patch %d: %w", patchIndex+1, err)
 					}
@@ -395,6 +412,7 @@ func batch(ctx context.Context, args []string) error {
 					Context: ctx, Validate: job.Validate, RemoveHeader: job.RemoveHeader,
 					AddHeader: job.AddHeader, FixChecksum: job.FixChecksum,
 					SourceName: sourceName, Direction: direction, MaxOutputSize: job.MaxOutput,
+					MaxDictionarySize: job.MaxDictionary, MaxWindowSize: job.MaxWindow,
 				})
 			}()
 			if err != nil {
@@ -403,13 +421,13 @@ func batch(ctx context.Context, args []string) error {
 			results = append(results, result)
 			continue
 		}
-		source, sourceName, err := readInput(job.Source, job.SourceEntry, rompatcher.InputSource, 0)
+		source, sourceName, err := readInputContext(ctx, job.Source, job.SourceEntry, rompatcher.InputSource, job.MaxInput)
 		if err != nil {
 			return fmt.Errorf("job %d source: %w", index+1, err)
 		}
 		patches := make([][]byte, 0, len(job.Patches))
 		for _, item := range job.Patches {
-			data, _, err := readInput(item.Path, item.Entry, rompatcher.InputPatch, 256<<20)
+			data, _, err := readInputContext(ctx, item.Path, item.Entry, rompatcher.InputPatch, job.MaxInput)
 			if err != nil {
 				return fmt.Errorf("job %d patch: %w", index+1, err)
 			}
@@ -419,6 +437,7 @@ func batch(ctx context.Context, args []string) error {
 			Context: ctx, Validate: job.Validate, RemoveHeader: job.RemoveHeader,
 			AddHeader: job.AddHeader, FixChecksum: job.FixChecksum,
 			SourceName: sourceName, Direction: direction, MaxOutputSize: job.MaxOutput,
+			MaxDictionarySize: job.MaxDictionary, MaxWindowSize: job.MaxWindow,
 		})
 		if err != nil {
 			return fmt.Errorf("job %d: %w", index+1, err)
@@ -432,8 +451,9 @@ func batch(ctx context.Context, args []string) error {
 	return emit(*jsonOutput, map[string]any{"status": "ok", "jobs": results}, fmt.Sprintf("completed %d batch jobs", len(results)))
 }
 
-func create(ctx context.Context, args []string) error {
+func create(ctx context.Context, args []string) (err error) {
 	f := flag.NewFlagSet("create", flag.ContinueOnError)
+	defer func() { err = commandFailure(f, err) }()
 	format := f.String("format", "ips", "patch format: ips, ips32, ebp, ups, bps, aps, ppf, rup")
 	f.StringVar(format, "f", "ips", "alias for --format")
 	description := f.String("description", "", "patch description or metadata")
@@ -448,6 +468,7 @@ func create(ctx context.Context, args []string) error {
 	f.BoolVar(progress, "p", false, "alias for --progress")
 	maxPatch := f.Uint64("max-patch", 0, "maximum patch size in bytes")
 	f.Uint64Var(maxPatch, "m", 0, "alias for --max-patch")
+	maxInput := f.Uint64("max-input", 0, "maximum size of each input in bytes")
 	delta := f.Bool("delta", false, "use memory-intensive BPS delta matching")
 	outputFlag := f.String("output", "", "output patch; use - for stdout")
 	f.StringVar(outputFlag, "o", "", "alias for --output")
@@ -468,6 +489,7 @@ options:
   -j, --json                emit machine-readable JSON
   -p, --progress            show progress on stderr
   -m, --max-patch BYTES     reject larger patches
+      --max-input BYTES     reject larger inputs or ZIP entries
       --delta               use memory-intensive BPS delta matching
       --original-entry NAME original entry inside a ZIP
       --modified-entry NAME modified entry inside a ZIP`)
@@ -505,12 +527,12 @@ options:
 		}
 	}
 	if f.Arg(0) != "-" && f.Arg(1) != "-" && *outputFlag != "-" {
-		originalPath, sourceName, cleanOriginal, err := materializeInput(f.Arg(0), *originalEntry, rompatcher.InputSource, 0)
+		originalPath, sourceName, cleanOriginal, err := materializeInputContext(ctx, f.Arg(0), *originalEntry, rompatcher.InputSource, *maxInput)
 		if err != nil {
 			return err
 		}
 		defer cleanOriginal()
-		modifiedPath, modifiedName, cleanModified, err := materializeInput(f.Arg(1), *modifiedEntry, rompatcher.InputSource, 0)
+		modifiedPath, modifiedName, cleanModified, err := materializeInputContext(ctx, f.Arg(1), *modifiedEntry, rompatcher.InputSource, *maxInput)
 		if err != nil {
 			return err
 		}
@@ -533,11 +555,11 @@ options:
 		}
 		return emit(*jsonOutput, map[string]any{"status": "ok", "output": output, "format": formatName, "size": info.Size()}, "patch written to "+output)
 	}
-	original, sourceName, err := readInput(f.Arg(0), *originalEntry, rompatcher.InputSource, 0)
+	original, sourceName, err := readInputContext(ctx, f.Arg(0), *originalEntry, rompatcher.InputSource, *maxInput)
 	if err != nil {
 		return err
 	}
-	modified, modifiedName, err := readInput(f.Arg(1), *modifiedEntry, rompatcher.InputSource, 0)
+	modified, modifiedName, err := readInputContext(ctx, f.Arg(1), *modifiedEntry, rompatcher.InputSource, *maxInput)
 	if err != nil {
 		return err
 	}
@@ -575,14 +597,16 @@ options:
 	return emitTo(*jsonOutput, w, map[string]any{"status": "ok", "output": output, "format": p.Format(), "size": len(data)}, "patch written to "+output)
 }
 
-func inspect(args []string) error {
+func inspectContext(ctx context.Context, args []string) (err error) {
 	f := flag.NewFlagSet("inspect", flag.ContinueOnError)
+	defer func() { err = commandFailure(f, err) }()
 	jsonOutput := f.Bool("json", false, "write machine-readable JSON")
 	f.BoolVar(jsonOutput, "j", false, "alias for --json")
 	entry := f.String("entry", "", "patch entry inside a ZIP")
 	f.StringVar(entry, "e", "", "alias for --entry")
+	maxInput := f.Uint64("max-input", 0, "maximum patch or ZIP entry size in bytes")
 	f.Usage = func() {
-		fmt.Fprintln(f.Output(), "usage: rompatcher inspect [options] PATCH\n\noptions:\n  -e, --entry NAME  patch entry inside a ZIP\n  -j, --json        emit machine-readable JSON")
+		fmt.Fprintln(f.Output(), "usage: rompatcher inspect [options] PATCH\n\noptions:\n  -e, --entry NAME      patch entry inside a ZIP\n  -j, --json            emit machine-readable JSON\n      --max-input BYTES reject larger patch inputs")
 	}
 	if err := parseInterspersed(f, args); err != nil {
 		return err
@@ -590,7 +614,7 @@ func inspect(args []string) error {
 	if f.NArg() != 1 {
 		return errors.New("inspect requires PATCH")
 	}
-	data, _, err := readInput(f.Arg(0), *entry, rompatcher.InputPatch, 256<<20)
+	data, _, err := readInputContext(ctx, f.Arg(0), *entry, rompatcher.InputPatch, *maxInput)
 	if err != nil {
 		return err
 	}
@@ -626,8 +650,9 @@ func inspect(args []string) error {
 	return nil
 }
 
-func archive(args []string) error {
+func archive(args []string) (err error) {
 	f := flag.NewFlagSet("archive", flag.ContinueOnError)
+	defer func() { err = commandFailure(f, err) }()
 	jsonOutput := f.Bool("json", false, "write machine-readable JSON")
 	f.BoolVar(jsonOutput, "j", false, "alias for --json")
 	f.Usage = func() {
@@ -659,14 +684,16 @@ func archive(args []string) error {
 	return nil
 }
 
-func hashFile(ctx context.Context, args []string) error {
+func hashFile(ctx context.Context, args []string) (err error) {
 	f := flag.NewFlagSet("hash", flag.ContinueOnError)
+	defer func() { err = commandFailure(f, err) }()
 	jsonOutput := f.Bool("json", false, "write machine-readable JSON")
 	f.BoolVar(jsonOutput, "j", false, "alias for --json")
 	entry := f.String("entry", "", "file entry inside a ZIP")
 	f.StringVar(entry, "e", "", "alias for --entry")
+	maxInput := f.Uint64("max-input", 0, "maximum ZIP entry or buffered input size in bytes")
 	f.Usage = func() {
-		fmt.Fprintln(f.Output(), "usage: rompatcher hash [options] FILE\n\noptions:\n  -e, --entry NAME  file entry inside a ZIP\n  -j, --json        emit machine-readable JSON")
+		fmt.Fprintln(f.Output(), "usage: rompatcher hash [options] FILE\n\noptions:\n  -e, --entry NAME      file entry inside a ZIP\n  -j, --json            emit machine-readable JSON\n      --max-input BYTES reject larger ZIP or stdin inputs")
 	}
 	if err := parseInterspersed(f, args); err != nil {
 		return err
@@ -674,15 +701,15 @@ func hashFile(ctx context.Context, args []string) error {
 	if f.NArg() != 1 {
 		return errors.New("hash requires FILE")
 	}
-	var result rompatcher.HashInfo
+	var input io.Reader
 	if f.Arg(0) == "-" {
-		b, _, err := readInput("-", *entry, rompatcher.InputAny, 0)
+		b, _, err := readInputContext(ctx, "-", *entry, rompatcher.InputAny, *maxInput)
 		if err != nil {
 			return err
 		}
-		result = rompatcher.HashBytes(b)
+		input = bytes.NewReader(b)
 	} else {
-		path, _, cleanup, err := materializeInput(f.Arg(0), *entry, rompatcher.InputAny, 0)
+		path, _, cleanup, err := materializeInputContext(ctx, f.Arg(0), *entry, rompatcher.InputAny, *maxInput)
 		if err != nil {
 			return err
 		}
@@ -692,10 +719,11 @@ func hashFile(ctx context.Context, args []string) error {
 			return err
 		}
 		defer file.Close()
-		result, err = rompatcher.HashReader(ctx, file)
-		if err != nil {
-			return err
-		}
+		input = file
+	}
+	result, err := rompatcher.HashReader(ctx, input)
+	if err != nil {
+		return err
 	}
 	if *jsonOutput {
 		return emit(true, result, "")
@@ -704,21 +732,64 @@ func hashFile(ctx context.Context, args []string) error {
 	return nil
 }
 
-func readInput(path, entry string, kind rompatcher.InputKind, maxSize uint64) ([]byte, string, error) {
+const (
+	defaultMemoryInputLimit  = 512 << 20
+	defaultPatchInputLimit   = 256 << 20
+	defaultExtractInputLimit = 16 << 30
+)
+
+type cancelReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r cancelReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	n, err := r.r.Read(p)
+	if err == nil {
+		err = r.ctx.Err()
+	}
+	return n, err
+}
+
+func inputLimit(kind rompatcher.InputKind, materialized bool) uint64 {
+	if kind == rompatcher.InputPatch {
+		return defaultPatchInputLimit
+	}
+	if materialized {
+		return defaultExtractInputLimit
+	}
+	return defaultMemoryInputLimit
+}
+
+// Bound bytes actually read, even if a file grows after its initial size check.
+func readLimitedInput(ctx context.Context, reader io.Reader, maxSize uint64) ([]byte, error) {
+	if maxSize != 0 && maxSize < uint64(^uint64(0)>>1) {
+		reader = io.LimitReader(reader, int64(maxSize)+1)
+	}
+	data, err := io.ReadAll(cancelReader{ctx: ctx, r: reader})
+	if err != nil {
+		return nil, err
+	}
+	if maxSize != 0 && uint64(len(data)) > maxSize {
+		return nil, fmt.Errorf("input exceeds size limit: %d > %d", len(data), maxSize)
+	}
+	return data, nil
+}
+
+func readInputContext(ctx context.Context, path, entry string, kind rompatcher.InputKind, maxSize uint64) ([]byte, string, error) {
+	if maxSize == 0 {
+		maxSize = inputLimit(kind, false)
+	}
 	if path == "-" {
-		reader := io.Reader(os.Stdin)
-		if maxSize != 0 && maxSize < uint64(^uint64(0)>>1) {
-			reader = io.LimitReader(reader, int64(maxSize)+1)
-		}
-		data, err := io.ReadAll(reader)
+		data, err := readLimitedInput(ctx, os.Stdin, maxSize)
 		if err != nil {
 			return nil, "", err
 		}
-		if maxSize != 0 && uint64(len(data)) > maxSize {
-			return nil, "", fmt.Errorf("input exceeds size limit: %d > %d", len(data), maxSize)
-		}
 		if bytes.HasPrefix(data, []byte{'P', 'K', 3, 4}) {
-			return rompatcher.ReadZIPBytes(data, entry, kind, maxSize)
+			return rompatcher.ReadZIPBytesContext(ctx, data, entry, kind, maxSize)
 		}
 		if entry != "" {
 			return nil, "", errors.New("entry requires ZIP input")
@@ -726,7 +797,7 @@ func readInput(path, entry string, kind rompatcher.InputKind, maxSize uint64) ([
 		return data, "stdin", nil
 	}
 	if isZIP(path) {
-		return rompatcher.ReadZIP(path, entry, kind, maxSize)
+		return rompatcher.ReadZIPContext(ctx, path, entry, kind, maxSize)
 	}
 	if entry != "" {
 		return nil, "", errors.New("entry requires ZIP input")
@@ -745,11 +816,11 @@ func readInput(path, entry string, kind rompatcher.InputKind, maxSize uint64) ([
 			return nil, "", fmt.Errorf("input exceeds size limit: %d > %d", info.Size(), maxSize)
 		}
 	}
-	b, err := io.ReadAll(file)
+	b, err := readLimitedInput(ctx, file, maxSize)
 	return b, path, err
 }
 
-func materializeInput(path, entry string, kind rompatcher.InputKind, maxSize uint64) (string, string, func(), error) {
+func materializeInputContext(ctx context.Context, path, entry string, kind rompatcher.InputKind, maxSize uint64) (string, string, func(), error) {
 	if !isZIP(path) {
 		if entry != "" {
 			return "", "", func() {}, errors.New("entry requires ZIP input")
@@ -765,6 +836,9 @@ func materializeInput(path, entry string, kind rompatcher.InputKind, maxSize uin
 		}
 		return path, path, func() {}, nil
 	}
+	if maxSize == 0 {
+		maxSize = inputLimit(kind, true)
+	}
 	tmp, err := os.CreateTemp("", "rompatcher-input-*")
 	if err != nil {
 		return "", "", func() {}, err
@@ -773,7 +847,7 @@ func materializeInput(path, entry string, kind rompatcher.InputKind, maxSize uin
 		_ = tmp.Close()
 		_ = os.Remove(tmp.Name())
 	}
-	name, err := rompatcher.ExtractZIP(path, entry, kind, maxSize, tmp)
+	name, err := rompatcher.ExtractZIPContext(ctx, path, entry, kind, maxSize, tmp)
 	if err != nil {
 		cleanup()
 		return "", "", func() {}, err
@@ -842,10 +916,12 @@ func defaultOutputPath(sourcePath, sourceName string) string {
 // before or after filenames, as users expect from a modern CLI.
 func parseInterspersed(f *flag.FlagSet, args []string) error {
 	flags, positional := make([]string, 0, len(args)), make([]string, 0, len(args))
+	separated := false
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if arg == "--" {
 			positional = append(positional, args[i+1:]...)
+			separated = true
 			break
 		}
 		if arg == "-" || !strings.HasPrefix(arg, "-") {
@@ -865,14 +941,21 @@ func parseInterspersed(f *flag.FlagSet, args []string) error {
 			continue
 		}
 		if i+1 >= len(args) {
-			return fmt.Errorf("flag needs an argument: %s", arg)
+			// Let flag.Parse produce the error and retain preceding options,
+			// without treating a reordered positional as the missing value.
+			positional = nil
+			break
 		}
 		i++
 		flags = append(flags, args[i])
 	}
 	output := f.Output()
 	f.SetOutput(io.Discard)
-	err := f.Parse(append(flags, positional...))
+	parsed := flags
+	if separated {
+		parsed = append(parsed, "--")
+	}
+	err := f.Parse(append(parsed, positional...))
 	f.SetOutput(output)
 	if errors.Is(err, flag.ErrHelp) {
 		f.Usage()

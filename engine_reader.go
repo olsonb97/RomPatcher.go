@@ -74,7 +74,7 @@ func (d *readerDecoder) read(dst []byte) error {
 		d.off += int64(n)
 		dst = dst[n:]
 	}
-	return nil
+	return d.ctx.Err()
 }
 
 func (d *readerDecoder) bytes(length int64) ([]byte, error) {
@@ -151,22 +151,14 @@ func readBPSVLVReader(d *readerDecoder) (uint64, error) {
 		if err != nil {
 			return 0, err
 		}
-		add := uint64(x&0x7f) * shift
-		if value > ^uint64(0)-add {
-			return 0, fmt.Errorf("%w: variable integer overflow", ErrInvalidPatch)
+		var done bool
+		value, shift, done, err = addBPSVLVByte(value, shift, x)
+		if err != nil {
+			return 0, err
 		}
-		value += add
-		if x&0x80 != 0 {
+		if done {
 			return value, nil
 		}
-		if shift > ^uint64(0)>>7 {
-			return 0, fmt.Errorf("%w: variable integer overflow", ErrInvalidPatch)
-		}
-		shift <<= 7
-		if value > ^uint64(0)-shift {
-			return 0, fmt.Errorf("%w: variable integer overflow", ErrInvalidPatch)
-		}
-		value += shift
 	}
 	return 0, fmt.Errorf("%w: variable integer too long", ErrInvalidPatch)
 }

@@ -2,6 +2,7 @@ package rompatcher
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
@@ -10,6 +11,54 @@ import (
 	"strconv"
 	"strings"
 )
+
+// Match size and digest together for the same reversible endpoint.
+func matchReversibleEndpoints[T comparable](size, sourceSize, targetSize uint64, digest, sourceDigest, targetDigest T) (bool, bool) {
+	return size == sourceSize && digest == sourceDigest, size == targetSize && digest == targetDigest
+}
+
+func acceptsEndpoint(direction ApplyDirection, forward, reverse bool) bool {
+	switch direction {
+	case ApplyDirectionForward:
+		return forward
+	case ApplyDirectionReverse:
+		return reverse
+	default:
+		return forward || reverse
+	}
+}
+
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+type contextWriter struct {
+	ctx context.Context
+	w   io.Writer
+}
+
+func (w contextWriter) Write(p []byte) (int, error) {
+	if err := w.ctx.Err(); err != nil {
+		return 0, err
+	}
+	n, err := w.w.Write(p)
+	if err == nil {
+		err = w.ctx.Err()
+	}
+	return n, err
+}
+
+func (r contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	n, err := r.r.Read(p)
+	if err == nil {
+		err = r.ctx.Err()
+	}
+	return n, err
+}
 
 func isNilInterface(value any) bool {
 	if value == nil {

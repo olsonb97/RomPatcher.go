@@ -1,6 +1,7 @@
 package rompatcher
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -61,9 +62,22 @@ func (p *IPSPatch) Apply(source []byte, options ApplyOptions) ([]byte, error) {
 
 // MarshalBinary implements Patch.
 func (p *IPSPatch) MarshalBinary() ([]byte, error) {
+	return p.marshalBinaryContext(context.Background())
+}
+
+func (p *IPSPatch) marshalBinaryContext(ctx context.Context) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if p.HasTruncate && p.Metadata != nil {
+		return nil, fmt.Errorf("%w: EBP metadata cannot be combined with IPS truncation", ErrInvalidPatch)
+	}
 	out := make([]byte, 0, 8+len(p.records)*8)
 	out = append(out, "PATCH"...)
 	for _, r := range p.records {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if r.offset < 0 || r.offset >= ipsMaxSize || r.offset == 0x454f46 {
 			return nil, fmt.Errorf("%w: IPS offset 0x%x", ErrInvalidPatch, r.offset)
 		}
@@ -90,13 +104,42 @@ func (p *IPSPatch) MarshalBinary() ([]byte, error) {
 		}
 		out = appendU24BE(out, uint32(p.Truncate))
 	} else if p.Metadata != nil {
-		b, err := json.Marshal(p.Metadata)
+		b, err := marshalEBPMetadata(ctx, p.Metadata)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, b...)
 	}
-	return out, nil
+	return out, ctx.Err()
+}
+
+func marshalEBPMetadata(ctx context.Context, metadata map[string]string) ([]byte, error) {
+	// Check a lower bound first, so caller-supplied huge strings cannot make
+	// json.Marshal allocate an unbounded temporary before the encoded cap.
+	rawSize := uint64(0)
+	for key, value := range metadata {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		rawSize += uint64(len(key)) + uint64(len(value))
+		if rawSize > maxEBPMetadataSize {
+			return nil, fmt.Errorf("%w: EBP metadata exceeds %d bytes", ErrOutputTooLarge, maxEBPMetadataSize)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	data, err := json.Marshal(metadata)
+	if canceled := ctx.Err(); canceled != nil {
+		return nil, canceled
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxEBPMetadataSize {
+		return nil, fmt.Errorf("%w: EBP metadata exceeds %d bytes", ErrOutputTooLarge, maxEBPMetadataSize)
+	}
+	return data, nil
 }
 
 func parseIPS(data []byte) (*IPSPatch, error) {
@@ -124,6 +167,9 @@ func parseIPS(data []byte) (*IPSPatch, error) {
 				return p, nil
 			default:
 				if d.remaining() > 0 && d.b[d.off] == '{' {
+					if d.remaining() > maxEBPMetadataSize {
+						return nil, fmt.Errorf("%w: EBP metadata exceeds %d bytes", ErrOutputTooLarge, maxEBPMetadataSize)
+					}
 					if err := json.Unmarshal(d.b[d.off:], &p.Metadata); err != nil {
 						return nil, fmt.Errorf("%w: EBP metadata: %v", ErrInvalidPatch, err)
 					}

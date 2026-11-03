@@ -1,6 +1,9 @@
 package rompatcher
 
-import "fmt"
+import (
+	"bytes"
+	"fmt"
+)
 
 // ChainStep reports the result of one patch in an ordered chain.
 type ChainStep struct {
@@ -32,21 +35,31 @@ func ApplyChain(source []byte, patches [][]byte, opts ApplyOptions) (ChainResult
 		if err := reportProgress(opts, Progress{Phase: "chain", Completed: int64(index), Total: int64(len(patches))}); err != nil {
 			return result, err
 		}
-		p, err := Parse(data)
-		if err != nil {
-			return result, fmt.Errorf("patch %d: %w", index+1, err)
-		}
 		stepOptions := opts
 		// Internal checksum repair is a final-output transformation. Applying it
 		// between patches can invalidate the next patch's expected source bytes.
 		if index+1 < len(patches) {
 			stepOptions.FixChecksum = false
 		}
-		current, err = Apply(current, data, stepOptions)
+		var p Patch
+		current, err = applyWithROMTransforms(current, stepOptions, func(working []byte, effective ApplyOptions) ([]byte, error) {
+			var err error
+			p, err = parseWithOptions(data, effective)
+			if err != nil {
+				return nil, err
+			}
+			return applyMemoryRaw(working, data, effective)
+		})
 		if err != nil {
+			if p == nil {
+				return result, fmt.Errorf("patch %d: %w", index+1, err)
+			}
 			return result, fmt.Errorf("patch %d (%s): %w", index+1, p.Format(), err)
 		}
-		hashes := HashBytes(current)
+		hashes, err := HashReader(contextOf(opts), bytes.NewReader(current))
+		if err != nil {
+			return result, fmt.Errorf("patch %d output hashes: %w", index+1, err)
+		}
 		result.Steps = append(result.Steps, ChainStep{
 			Index: index + 1, Inspection: InspectParsed(p),
 			Output: ArtifactInfo{Size: sizePtr(uint64(len(current))), Hashes: map[string]string{"crc32": hashes.CRC32, "sha1": hashes.SHA1}},

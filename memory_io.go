@@ -46,6 +46,9 @@ func (f *memoryFile) WriteAt(src []byte, offset int64) (int, error) {
 }
 
 func applyMemoryRaw(source, patchData []byte, opts ApplyOptions) ([]byte, error) {
+	if err := checkCanceled(opts); err != nil {
+		return nil, err
+	}
 	// Most patches preserve or grow the source size. Reusing that size as
 	// capacity avoids repeated reallocations without changing the exact result.
 	output := &memoryFile{data: make([]byte, 0, len(source))}
@@ -70,12 +73,18 @@ func applyWithROMTransforms(source []byte, opts ApplyOptions, apply func([]byte,
 	var header []byte
 	fake := 0
 	if opts.RemoveHeader {
-		h, rom, _ := RemoveHeader(source, opts.SourceName)
+		h, rom, _, err := removeHeaderContext(contextOf(opts), source, opts.SourceName)
+		if err != nil {
+			return nil, err
+		}
 		if h != nil {
 			header, working = h, rom
 		}
 	} else if opts.AddHeader {
-		with, info := AddHeader(source, opts.SourceName)
+		with, info, err := addHeaderContext(contextOf(opts), source, opts.SourceName)
+		if err != nil {
+			return nil, err
+		}
 		if info != nil {
 			working, fake = with, info.Size
 		}
@@ -100,25 +109,33 @@ func applyWithROMTransforms(source []byte, opts ApplyOptions, apply func([]byte,
 	}
 	if header != nil {
 		if opts.FixChecksum {
-			FixROMChecksum(out, opts.SourceName)
+			if _, err := fixROMChecksumContext(contextOf(opts), out, opts.SourceName); err != nil {
+				return nil, err
+			}
 		}
 		if len(out) > int(^uint(0)>>1)-len(header) {
 			return nil, ErrOutputTooLarge
 		}
 		joined := make([]byte, len(header)+len(out))
 		copy(joined, header)
-		copy(joined[len(header):], out)
+		if err := copyBytesContext(contextOf(opts), joined[len(header):], out); err != nil {
+			return nil, err
+		}
 		out = joined
 	} else if fake > 0 {
 		if len(out) < fake {
 			return nil, fmt.Errorf("%w: patched output is smaller than temporary header", ErrInvalidPatch)
 		}
-		out = append([]byte(nil), out[fake:]...)
+		out = out[fake:]
 		if opts.FixChecksum {
-			FixROMChecksum(out, opts.SourceName)
+			if _, err := fixROMChecksumContext(contextOf(opts), out, opts.SourceName); err != nil {
+				return nil, err
+			}
 		}
 	} else if opts.FixChecksum {
-		FixROMChecksum(out, opts.SourceName)
+		if _, err := fixROMChecksumContext(contextOf(opts), out, opts.SourceName); err != nil {
+			return nil, err
+		}
 	}
 	if err := checkOutputSize(uint64(len(out)), len(source), opts); err != nil {
 		return nil, err

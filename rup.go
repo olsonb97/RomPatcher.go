@@ -1,6 +1,8 @@
 package rompatcher
 
 import (
+	"context"
+	"crypto/md5"
 	"encoding/hex"
 	"fmt"
 	"strings"
@@ -35,13 +37,27 @@ func (p *RUPPatch) Description() string { return p.PatchDescription }
 
 // ValidateSource implements Patch and accepts either reversible endpoint.
 func (p *RUPPatch) ValidateSource(source []byte) bool {
-	sum := MD5(source)
+	valid, _ := p.validateSourceContext(context.Background(), source, ApplyDirectionAuto)
+	return valid
+}
+
+func (p *RUPPatch) validateSourceContext(ctx context.Context, source []byte, direction ApplyDirection) (bool, error) {
+	h := md5.New()
+	if err := hashBytesContext(ctx, h, source); err != nil {
+		return false, err
+	}
+	sum := hex.EncodeToString(h.Sum(nil))
+	size := uint64(len(source))
 	for _, f := range p.files {
-		if sum == f.SourceMD5 || sum == f.TargetMD5 {
-			return true
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		forward, reverse := matchReversibleEndpoints(size, f.SourceSize, f.TargetSize, sum, f.SourceMD5, f.TargetMD5)
+		if acceptsEndpoint(direction, forward, reverse) {
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // ValidationInfo implements Patch.
@@ -53,7 +69,7 @@ func (p *RUPPatch) ValidationInfo() *ValidationInfo {
 	return &ValidationInfo{Type: "MD5", Values: v}
 }
 
-func validateRUPFile(f *rupFile) error {
+func validateRUPFile(ctx context.Context, f *rupFile) error {
 	var maximum, overflowSize uint64
 	switch {
 	case f.SourceSize < f.TargetSize:
@@ -78,6 +94,9 @@ func validateRUPFile(f *rupFile) error {
 		return fmt.Errorf("%w: RUP overflow length", ErrInvalidPatch)
 	}
 	for _, r := range f.records {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		length := uint64(len(r.xor))
 		if length == 0 || length > maximum || r.offset > maximum-length {
 			return fmt.Errorf("%w: RUP record outside file range", ErrInvalidPatch)
@@ -134,6 +153,14 @@ func md5Bytes(s string) ([]byte, error) {
 
 // MarshalBinary implements Patch.
 func (p *RUPPatch) MarshalBinary() ([]byte, error) {
+	return p.marshalBinaryContext(context.Background())
+}
+
+func (p *RUPPatch) marshalBinaryContext(ctx context.Context) ([]byte, error) {
+	var err error
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(p.files) == 0 {
 		return nil, fmt.Errorf("%w: RUP has no files", ErrInvalidPatch)
 	}
@@ -146,17 +173,23 @@ func (p *RUPPatch) MarshalBinary() ([]byte, error) {
 	out = append(out, fixedString(p.Language, 48)...)
 	out = append(out, fixedString(p.Date, 8)...)
 	out = append(out, fixedString(p.Web, 512)...)
-	out = append(out, fixedString(strings.ReplaceAll(p.PatchDescription, "\n", "\\n"), 1074)...)
+	out = append(out, fixedString(strings.ReplaceAll(p.PatchDescription[:min(len(p.PatchDescription), 1074)], "\n", "\\n"), 1074)...)
 	if len(out) != 0x800 {
 		return nil, fmt.Errorf("%w: RUP header size", ErrInvalidPatch)
 	}
 	for _, f := range p.files {
-		if e := validateRUPFile(&f); e != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if e := validateRUPFile(ctx, &f); e != nil {
 			return nil, e
 		}
 		out = append(out, 1)
 		out = appendRUPVLV(out, uint64(len(f.FileName)))
-		out = append(out, f.FileName...)
+		out, err = appendContext(ctx, out, f.FileName)
+		if err != nil {
+			return nil, err
+		}
 		out = append(out, f.ROMType)
 		out = appendRUPVLV(out, f.SourceSize)
 		out = appendRUPVLV(out, f.TargetSize)
@@ -176,17 +209,26 @@ func (p *RUPPatch) MarshalBinary() ([]byte, error) {
 			}
 			out = append(out, f.OverflowMode)
 			out = appendRUPVLV(out, uint64(len(f.Overflow)))
-			out = append(out, f.Overflow...)
+			out, err = appendContext(ctx, out, f.Overflow)
+			if err != nil {
+				return nil, err
+			}
 		}
 		for _, r := range f.records {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			out = append(out, 2)
 			out = appendRUPVLV(out, r.offset)
 			out = appendRUPVLV(out, uint64(len(r.xor)))
-			out = append(out, r.xor...)
+			out, err = appendContext(ctx, out, r.xor)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 	out = append(out, 0)
-	return out, nil
+	return out, ctx.Err()
 }
 
 func parseRUP(data []byte) (*RUPPatch, error) {
@@ -236,7 +278,7 @@ func parseRUP(data []byte) (*RUPPatch, error) {
 		switch cmd {
 		case 0:
 			if current != nil {
-				if e := validateRUPFile(current); e != nil {
+				if e := validateRUPFile(context.Background(), current); e != nil {
 					return nil, e
 				}
 				p.files = append(p.files, *current)
@@ -250,7 +292,7 @@ func parseRUP(data []byte) (*RUPPatch, error) {
 			return p, nil
 		case 1:
 			if current != nil {
-				if e := validateRUPFile(current); e != nil {
+				if e := validateRUPFile(context.Background(), current); e != nil {
 					return nil, e
 				}
 				p.files = append(p.files, *current)

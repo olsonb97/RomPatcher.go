@@ -14,6 +14,8 @@ type ipsStreamInfo struct {
 	records    int64
 }
 
+const maxEBPMetadataSize = 1 << 20
+
 func scanIPSStream(ctx context.Context, patch io.ReaderAt, patchSize, sourceSize int64, ips32 bool) (ipsStreamInfo, error) {
 	info := ipsStreamInfo{format: FormatIPS, targetSize: sourceSize}
 	headerSize := int64(5)
@@ -60,14 +62,27 @@ func scanIPSStream(ctx context.Context, patch io.ReaderAt, patchSize, sourceSize
 				if err != nil || first != '{' {
 					return info, fmt.Errorf("%w: unsupported data after IPS EOF", ErrInvalidPatch)
 				}
-				reader := io.MultiReader(bytes.NewReader([]byte{'{'}), sectionReader(patch, d.off, d.remaining()))
+				metadataSize := d.remaining() + 1
+				if metadataSize > maxEBPMetadataSize {
+					return info, fmt.Errorf("%w: EBP metadata exceeds %d bytes", ErrOutputTooLarge, maxEBPMetadataSize)
+				}
+				reader := contextReader{ctx: ctx, r: io.MultiReader(bytes.NewReader([]byte{'{'}), sectionReader(patch, d.off, d.remaining()))}
 				decoder := json.NewDecoder(reader)
 				var metadata map[string]string
 				if err := decoder.Decode(&metadata); err != nil || metadata == nil {
+					if canceled := ctx.Err(); canceled != nil {
+						return info, canceled
+					}
 					return info, fmt.Errorf("%w: EBP metadata", ErrInvalidPatch)
 				}
 				if err := decoder.Decode(&struct{}{}); err != io.EOF {
+					if canceled := ctx.Err(); canceled != nil {
+						return info, canceled
+					}
 					return info, fmt.Errorf("%w: EBP metadata", ErrInvalidPatch)
+				}
+				if err := ctx.Err(); err != nil {
+					return info, err
 				}
 				info.format = FormatEBP
 				return info, nil

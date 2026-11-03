@@ -1,6 +1,10 @@
 package rompatcher
 
-import "fmt"
+import (
+	"bytes"
+	"context"
+	"fmt"
+)
 
 // ArtifactInfo describes an input or output by size and hashes.
 type ArtifactInfo struct {
@@ -82,7 +86,10 @@ func InspectParsed(p Patch) Inspection {
 		i.Target.Hashes = map[string]string{"crc32": fmt.Sprintf("%08x", x.TargetCRC)}
 	case *BPSPatch:
 		i.RecordCountKnown = true
-		i.RecordCount = len(x.actions)
+		i.RecordCount = x.actionCount
+		if x.encodedActions == nil {
+			i.RecordCount = len(x.actions)
+		}
 		i.Source.Size, i.Target.Size = sizePtr(x.SourceSize), sizePtr(x.TargetSize)
 		i.Source.Hashes = map[string]string{"crc32": fmt.Sprintf("%08x", x.SourceCRC)}
 		i.Target.Hashes = map[string]string{"crc32": fmt.Sprintf("%08x", x.TargetCRC)}
@@ -137,14 +144,34 @@ func InspectParsed(p Patch) Inspection {
 
 // DryRun applies a patch in memory without writing a file and reports the result.
 func DryRun(source, patchData []byte, opts ApplyOptions) (DryRunResult, error) {
-	p, err := Parse(patchData)
+	if err := checkCanceled(opts); err != nil {
+		return DryRunResult{}, err
+	}
+	direction, err := ParseApplyDirection(string(opts.Direction))
 	if err != nil {
 		return DryRunResult{}, err
 	}
-	result := DryRunResult{Inspection: InspectParsed(p)}
+	opts.Direction = direction
+	result := DryRunResult{}
 	out, err := applyWithROMTransforms(source, opts, func(working []byte, applyOptions ApplyOptions) ([]byte, error) {
+		p, err := parseWithOptions(patchData, applyOptions)
+		if err != nil {
+			return nil, err
+		}
+		result.Inspection = InspectParsed(p)
 		if p.ValidationInfo() != nil {
-			valid := p.ValidateSource(working)
+			var valid bool
+			if validator, ok := p.(interface {
+				validateSourceContext(context.Context, []byte, ApplyDirection) (bool, error)
+			}); ok {
+				var err error
+				valid, err = validator.validateSourceContext(contextOf(applyOptions), working, applyOptions.Direction)
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				valid = p.ValidateSource(working)
+			}
 			result.SourceValid = &valid
 		}
 		return applyMemoryRaw(working, patchData, applyOptions)
@@ -152,7 +179,10 @@ func DryRun(source, patchData []byte, opts ApplyOptions) (DryRunResult, error) {
 	if err != nil {
 		return result, err
 	}
-	hashes := HashBytes(out)
+	hashes, err := HashReader(contextOf(opts), bytes.NewReader(out))
+	if err != nil {
+		return result, err
+	}
 	result.Output.Size = sizePtr(uint64(hashes.Size))
 	result.Output.Hashes = map[string]string{
 		"crc32": hashes.CRC32,
